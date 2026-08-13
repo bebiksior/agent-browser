@@ -31,6 +31,14 @@ export AGENT_BROWSER_SESSION="$(agent-browser session id --scope worktree --pref
 
 The default (unnamed) session is a single shared browser: it is shared with every other agent on the machine and it persists across conversations, so working in it can hijack another agent's page mid-task or navigate away from something the human left open. Every example below assumes a named session is active. See [Run multiple browsers in parallel](#run-multiple-browsers-in-parallel) and `references/session-management.md`.
 
+Agent runtimes derive a worker-specific session when possible. CDP attachments are pinned to their owned tab, dialogs are retained, page content is bounded, and navigation returns on dialogs by default:
+
+```bash
+agent-browser open https://target.example --wait commit --timeout 10000
+```
+
+Treat `navigation_timeout` as partial evidence, not a dead browser. Inspect `data.navigation.committed`, `data.url`, `data.targetId`, `data.navigation.browserUsable`, and any pending dialog before retrying.
+
 ## Quickstart
 
 ```bash
@@ -334,6 +342,42 @@ agent-browser network har stop /tmp/trace.har
 # `--content all` to include binary bodies or `--content none` to disable.
 ```
 
+Tracked requests include CDP request, frame, loader, document, initiator, and session IDs. Responses also expose common external correlation headers when present.
+
+### Security inspection and evidence
+
+```bash
+agent-browser frames tree
+agent-browser frame inspect <frame-id>
+agent-browser eval --frame <frame-id> --world isolated 'location.href'
+agent-browser targets tree
+
+agent-browser postmessage monitor start
+# exercise the UI
+agent-browser postmessage messages --origin https://trusted.example
+agent-browser postmessage send --from-frame <id> --target parent \
+  --target-origin https://target.example --data '{"type":"probe"}'
+agent-browser postmessage monitor stop
+
+agent-browser evidence start discoveries/repro
+# reproduce the behavior; actions, dialogs, console, errors, requests, and frames are retained
+agent-browser evidence capture
+agent-browser evidence stop
+```
+
+Evidence bundles default to sanitized `redacted/` artifacts plus a root manifest with SHA-256 hashes and explicit gaps. Screenshots are omitted unless a separately pixel-redacted source exists. Add `--include-private` to `evidence start` only when owner-only raw headers, bodies, cookies, console values, and screenshots are required.
+
+Use selective state and clean contexts for multi-role tests:
+
+```bash
+agent-browser state save auth.json --cookies-only
+agent-browser state clone auth.json victim-cookies.json --cookies-only
+agent-browser state diff before.json after.json
+agent-browser context new --state victim-cookies.json --cookies-only https://target.example
+agent-browser context list
+agent-browser context close <browser-context-id>
+```
+
 ### Record a video of the workflow
 
 ```bash
@@ -377,7 +421,11 @@ agent-browser dialog status          # is there a pending dialog?
 agent-browser dialog accept           # accept
 agent-browser dialog accept "text"    # accept with prompt input
 agent-browser dialog dismiss          # cancel
+agent-browser dialog wait --timeout 5000
+agent-browser dialog history           # retained after the dialog closes
 ```
+
+Alerts and beforeunload dialogs are retained instead of auto-accepted. `open --wait commit` returns immediately with dialog metadata so the next command can accept or dismiss it. Click already returns when it opens a dialog; do not add a blind sleep.
 
 ## Diagnosing install issues
 
@@ -448,6 +496,7 @@ EOF
 --restore [name]        # auto-save/restore session state, defaults to --session
 --restore-save <policy> # auto, always, or never
 --namespace <name>      # isolate daemon sockets and restore-state directories
+--timeout <ms>          # default action/navigation timeout
 ```
 
 ## When to load another skill

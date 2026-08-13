@@ -102,6 +102,24 @@ const TOOL_FRAME_MAIN: &str = "agent_browser_frame_main";
 const TOOL_DIALOG_STATUS: &str = "agent_browser_dialog_status";
 const TOOL_DIALOG_ACCEPT: &str = "agent_browser_dialog_accept";
 const TOOL_DIALOG_DISMISS: &str = "agent_browser_dialog_dismiss";
+const TOOL_DIALOG_WAIT: &str = "agent_browser_dialog_wait";
+const TOOL_DIALOG_HISTORY: &str = "agent_browser_dialog_history";
+const TOOL_FRAMES: &str = "agent_browser_frames";
+const TOOL_FRAME_INSPECT: &str = "agent_browser_frame_inspect";
+const TOOL_TARGETS: &str = "agent_browser_targets";
+const TOOL_CONTEXT_NEW: &str = "agent_browser_context_new";
+const TOOL_CONTEXT_LIST: &str = "agent_browser_context_list";
+const TOOL_CONTEXT_CLOSE: &str = "agent_browser_context_close";
+const TOOL_POSTMESSAGE_MONITOR_START: &str = "agent_browser_postmessage_monitor_start";
+const TOOL_POSTMESSAGE_MONITOR_STOP: &str = "agent_browser_postmessage_monitor_stop";
+const TOOL_POSTMESSAGE_MESSAGES: &str = "agent_browser_postmessage_messages";
+const TOOL_POSTMESSAGE_SEND: &str = "agent_browser_postmessage_send";
+const TOOL_EVIDENCE_START: &str = "agent_browser_evidence_start";
+const TOOL_EVIDENCE_STOP: &str = "agent_browser_evidence_stop";
+const TOOL_EVIDENCE_STATUS: &str = "agent_browser_evidence_status";
+const TOOL_EVIDENCE_CAPTURE: &str = "agent_browser_evidence_capture";
+const TOOL_BROWSER_OWNERS: &str = "agent_browser_browser_owners";
+const TOOL_BROWSER_LEASE: &str = "agent_browser_browser_lease";
 const TOOL_TRACE_START: &str = "agent_browser_trace_start";
 const TOOL_TRACE_STOP: &str = "agent_browser_trace_stop";
 const TOOL_PROFILER_START: &str = "agent_browser_profiler_start";
@@ -129,6 +147,8 @@ const TOOL_STATE_CLEAR: &str = "agent_browser_state_clear";
 const TOOL_STATE_SHOW: &str = "agent_browser_state_show";
 const TOOL_STATE_CLEAN: &str = "agent_browser_state_clean";
 const TOOL_STATE_RENAME: &str = "agent_browser_state_rename";
+const TOOL_STATE_CLONE: &str = "agent_browser_state_clone";
+const TOOL_STATE_DIFF: &str = "agent_browser_state_diff";
 const TOOL_TAP: &str = "agent_browser_tap";
 const TOOL_SWIPE: &str = "agent_browser_swipe";
 const TOOL_DEVICE: &str = "agent_browser_device";
@@ -367,6 +387,10 @@ const NETWORK_PROFILE_TOOLS: &[&str] = &[
     TOOL_NETWORK_REQUEST,
     TOOL_NETWORK_HAR_START,
     TOOL_NETWORK_HAR_STOP,
+    TOOL_POSTMESSAGE_MONITOR_START,
+    TOOL_POSTMESSAGE_MONITOR_STOP,
+    TOOL_POSTMESSAGE_MESSAGES,
+    TOOL_POSTMESSAGE_SEND,
 ];
 
 const STATE_PROFILE_TOOLS: &[&str] = &[
@@ -389,6 +413,8 @@ const STATE_PROFILE_TOOLS: &[&str] = &[
     TOOL_STATE_SHOW,
     TOOL_STATE_CLEAN,
     TOOL_STATE_RENAME,
+    TOOL_STATE_CLONE,
+    TOOL_STATE_DIFF,
     TOOL_SESSION,
     TOOL_SESSION_LIST,
     TOOL_SESSION_ID,
@@ -440,6 +466,12 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_INSTALL,
     TOOL_UPGRADE,
     TOOL_CHAT,
+    TOOL_EVIDENCE_START,
+    TOOL_EVIDENCE_STOP,
+    TOOL_EVIDENCE_STATUS,
+    TOOL_EVIDENCE_CAPTURE,
+    TOOL_BROWSER_OWNERS,
+    TOOL_BROWSER_LEASE,
 ];
 
 const TABS_PROFILE_TOOLS: &[&str] = &[
@@ -456,6 +488,14 @@ const TABS_PROFILE_TOOLS: &[&str] = &[
     TOOL_DIALOG_STATUS,
     TOOL_DIALOG_ACCEPT,
     TOOL_DIALOG_DISMISS,
+    TOOL_DIALOG_WAIT,
+    TOOL_DIALOG_HISTORY,
+    TOOL_FRAMES,
+    TOOL_FRAME_INSPECT,
+    TOOL_TARGETS,
+    TOOL_CONTEXT_NEW,
+    TOOL_CONTEXT_LIST,
+    TOOL_CONTEXT_CLOSE,
 ];
 
 const REACT_PROFILE_TOOLS: &[&str] = &[
@@ -754,7 +794,10 @@ fn tools() -> Vec<Value> {
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
-                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." }
+                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." },
+                "wait": { "type": "string", "enum": ["commit", "load", "domcontentloaded", "networkidle", "none"], "description": "Navigation completion state." },
+                "returnOnDialog": { "type": "boolean", "description": "Return successfully as soon as navigation opens a JavaScript dialog." },
+                "navigationTimeoutMs": { "type": "integer", "minimum": 1, "description": "Navigation timeout. Distinct from the MCP tool process timeout." },
             }),
             &[],
         ),
@@ -792,7 +835,8 @@ fn tools() -> Vec<Value> {
             "Click an element by @ref or CSS selector.",
             json!({
                 "selector": selector_schema(),
-                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." }
+                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." },
+                "noWait": { "type": "boolean", "default": false, "description": "Return after input dispatch without waiting for new-tab navigation lifecycle." }
             }),
             &["selector"],
         ),
@@ -890,7 +934,9 @@ fn tools() -> Vec<Value> {
             "Evaluate JavaScript",
             "Run JavaScript in the page using stdin to avoid shell escaping.",
             json!({
-                "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
+                "script": { "type": "string", "description": "JavaScript expression or script to evaluate." },
+                "frameId": { "type": "string", "description": "Stable CDP frame ID from agent_browser_frames." },
+                "world": { "type": "string", "enum": ["main", "isolated"], "description": "Evaluation world. Requires frameId." }
             }),
             &["script"],
         ),
@@ -1127,8 +1173,20 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_NETWORK_ROUTE,
             "Network route",
-            "Route matching requests.",
-            json!({ "url": { "type": "string" }, "abort": { "type": "boolean" }, "body": { "type": "string" }, "resourceType": { "type": "string", "description": "Comma-separated resource types." } }),
+            "Intercept matching requests at the request or response stage. Modified traffic is explicitly marked.",
+            json!({
+                "url": { "type": "string" },
+                "stage": { "type": "string", "enum": ["request", "response"] },
+                "abort": { "type": "boolean" },
+                "body": { "type": "string" },
+                "status": { "type": "integer" },
+                "responseHeaders": { "type": "object", "additionalProperties": { "type": "string" } },
+                "rewriteUrl": { "type": "string" },
+                "rewriteMethod": { "type": "string" },
+                "rewriteBody": { "type": "string" },
+                "requestHeaders": { "type": "object", "additionalProperties": { "type": "string" } },
+                "resourceType": { "type": "string", "description": "Comma-separated resource types." }
+            }),
             &["url"],
         ),
         tool(
@@ -1148,8 +1206,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_NETWORK_REQUEST,
             "Network request detail",
-            "Show one request by id.",
-            json!({ "requestId": { "type": "string" } }),
+            "Show one request by id and optionally write a private CDP reconstruction.",
+            json!({ "requestId": { "type": "string" }, "rawOut": { "type": "string" } }),
             &["requestId"],
         ),
         tool(
@@ -1279,6 +1337,32 @@ fn parity_tools() -> Vec<Value> {
             json!({}),
             &[],
         ),
+        tool(TOOL_DIALOG_WAIT, "Dialog wait", "Wait for a JavaScript dialog on the active tab.", json!({ "dialogTimeoutMs": { "type": "integer", "minimum": 1 } }), &[]),
+        tool(TOOL_DIALOG_HISTORY, "Dialog history", "Return retained dialog open/close history.", json!({ "clear": { "type": "boolean" } }), &[]),
+        tool(TOOL_FRAMES, "Frame graph", "Return stable frame IDs, origins, hierarchy, OOPIF sessions, and iframe policy.", json!({}), &[]),
+        tool(TOOL_FRAME_INSPECT, "Frame inspect", "Inspect one frame by stable CDP frame ID.", json!({ "frameId": { "type": "string" } }), &["frameId"]),
+        tool(TOOL_TARGETS, "Target graph", "Return pages, workers, popup openers, and browser contexts.", json!({}), &[]),
+        tool(TOOL_CONTEXT_NEW, "Context new", "Create an isolated browser context, optionally seeded from saved state.", json!({
+            "url": { "type": "string" },
+            "statePath": { "type": "string" },
+            "cookiesOnly": { "type": "boolean" }
+        }), &[]),
+        tool(TOOL_CONTEXT_LIST, "Context list", "List browser contexts and their targets.", json!({}), &[]),
+        tool(TOOL_CONTEXT_CLOSE, "Context close", "Dispose an isolated browser context.", json!({ "contextId": { "type": "string" } }), &["contextId"]),
+        tool(TOOL_POSTMESSAGE_MONITOR_START, "PostMessage monitor start", "Install the isolated-world PostMessage monitor.", json!({}), &[]),
+        tool(TOOL_POSTMESSAGE_MONITOR_STOP, "PostMessage monitor stop", "Stop the monitor and return its retained history.", json!({}), &[]),
+        tool(TOOL_POSTMESSAGE_MESSAGES, "PostMessage messages", "Read captured PostMessage events.", json!({
+            "origin": { "type": "string" },
+            "frameId": { "type": "string" },
+            "clear": { "type": "boolean" }
+        }), &[]),
+        tool(TOOL_POSTMESSAGE_SEND, "PostMessage send", "Send JSON to a precisely selected frame/window and target origin.", json!({
+            "fromFrame": { "type": "string" },
+            "toFrame": { "type": "string" },
+            "target": { "type": "string", "enum": ["self", "parent", "top", "opener"] },
+            "targetOrigin": { "type": "string" },
+            "data": {}
+        }), &["fromFrame", "targetOrigin", "data"]),
         tool(
             TOOL_TRACE_START,
             "Trace start",
@@ -1431,14 +1515,22 @@ fn parity_tools() -> Vec<Value> {
             TOOL_STATE_SAVE,
             "State save",
             "Save cookies and storage state.",
-            json!({ "path": { "type": "string" } }),
+            json!({
+                "path": { "type": "string" },
+                "categories": { "type": "array", "items": { "type": "string", "enum": ["cookies", "local-storage", "session-storage"] } },
+                "cookiesOnly": { "type": "boolean" }
+            }),
             &["path"],
         ),
         tool(
             TOOL_STATE_LOAD,
             "State load",
             "Load cookies and storage state.",
-            json!({ "path": { "type": "string" } }),
+            json!({
+                "path": { "type": "string" },
+                "categories": { "type": "array", "items": { "type": "string", "enum": ["cookies", "local-storage", "session-storage"] } },
+                "cookiesOnly": { "type": "boolean" }
+            }),
             &["path"],
         ),
         tool(
@@ -1476,6 +1568,27 @@ fn parity_tools() -> Vec<Value> {
             json!({ "oldName": { "type": "string" }, "newName": { "type": "string" } }),
             &["oldName", "newName"],
         ),
+        tool(TOOL_STATE_CLONE, "State clone", "Create a filtered state copy without overwriting an existing file.", json!({
+            "source": { "type": "string" },
+            "destination": { "type": "string" },
+            "categories": { "type": "array", "items": { "type": "string", "enum": ["cookies", "local-storage", "session-storage"] } },
+            "cookiesOnly": { "type": "boolean" }
+        }), &["source", "destination"]),
+        tool(TOOL_STATE_DIFF, "State diff", "Semantically compare two state files with values redacted by default.", json!({
+            "left": { "type": "string" },
+            "right": { "type": "string" },
+            "categories": { "type": "array", "items": { "type": "string", "enum": ["cookies", "local-storage", "session-storage"] } },
+            "showValues": { "type": "boolean" }
+        }), &["left", "right"]),
+        tool(TOOL_EVIDENCE_START, "Evidence start", "Start a redacted evidence bundle. Raw private artifacts are opt-in.", json!({ "path": { "type": "string" }, "includePrivate": { "type": "boolean" } }), &["path"]),
+        tool(TOOL_EVIDENCE_STOP, "Evidence stop", "Finalize evidence artifacts and a SHA-256 manifest.", json!({}), &[]),
+        tool(TOOL_EVIDENCE_STATUS, "Evidence status", "Return evidence capture status.", json!({}), &[]),
+        tool(TOOL_EVIDENCE_CAPTURE, "Evidence capture", "Add a full-page screenshot to the active evidence bundle.", json!({}), &[]),
+        tool(TOOL_BROWSER_OWNERS, "Browser owners", "List persistent session-to-target worker ownership.", json!({}), &[]),
+        tool(TOOL_BROWSER_LEASE, "Browser lease", "Acquire, inspect, or release an atomic browser profile lease.", json!({
+            "operation": { "type": "string", "enum": ["acquire", "status", "release"] },
+            "profile": { "type": "string", "description": "Profile path. Omit for session-scoped temporary profile." }
+        }), &["operation"]),
         tool(
             TOOL_TAP,
             "Tap",
@@ -1979,11 +2092,21 @@ fn is_read_only_tool(name: &str) -> bool {
             | TOOL_COOKIES_GET
             | TOOL_TAB_LIST
             | TOOL_DIALOG_STATUS
+            | TOOL_DIALOG_WAIT
+            | TOOL_DIALOG_HISTORY
+            | TOOL_FRAMES
+            | TOOL_FRAME_INSPECT
+            | TOOL_TARGETS
+            | TOOL_CONTEXT_LIST
+            | TOOL_POSTMESSAGE_MESSAGES
+            | TOOL_EVIDENCE_STATUS
+            | TOOL_BROWSER_OWNERS
             | TOOL_CLIPBOARD_READ
             | TOOL_AUTH_LIST
             | TOOL_AUTH_SHOW
             | TOOL_STATE_LIST
             | TOOL_STATE_SHOW
+            | TOOL_STATE_DIFF
             | TOOL_DEVICE
             | TOOL_REACT_TREE
             | TOOL_REACT_INSPECT
@@ -2146,7 +2269,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_NETWORK_ROUTE => call_network_route(arguments),
         TOOL_NETWORK_UNROUTE => call_optional_one(arguments, &["network", "unroute"], "url"),
         TOOL_NETWORK_REQUESTS => call_network_requests(arguments),
-        TOOL_NETWORK_REQUEST => call_one_string(arguments, "network request", "requestId"),
+        TOOL_NETWORK_REQUEST => call_network_request(arguments),
         TOOL_NETWORK_HAR_START => {
             let mut args: Vec<String> = ["network", "har", "start"]
                 .iter()
@@ -2178,6 +2301,22 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_DIALOG_STATUS => call_literal(arguments, &["dialog", "status"]),
         TOOL_DIALOG_ACCEPT => call_optional_one(arguments, &["dialog", "accept"], "text"),
         TOOL_DIALOG_DISMISS => call_literal(arguments, &["dialog", "dismiss"]),
+        TOOL_DIALOG_WAIT => call_dialog_wait(arguments),
+        TOOL_DIALOG_HISTORY => call_clearable_parts(arguments, &["dialog", "history"]),
+        TOOL_FRAMES => call_literal(arguments, &["frames", "tree"]),
+        TOOL_FRAME_INSPECT => call_one_string(arguments, "frame inspect", "frameId"),
+        TOOL_TARGETS => call_literal(arguments, &["targets", "tree"]),
+        TOOL_CONTEXT_NEW => call_context_new(arguments),
+        TOOL_CONTEXT_LIST => call_literal(arguments, &["context", "list"]),
+        TOOL_CONTEXT_CLOSE => call_one_string(arguments, "context close", "contextId"),
+        TOOL_POSTMESSAGE_MONITOR_START => {
+            call_literal(arguments, &["postmessage", "monitor", "start"])
+        }
+        TOOL_POSTMESSAGE_MONITOR_STOP => {
+            call_literal(arguments, &["postmessage", "monitor", "stop"])
+        }
+        TOOL_POSTMESSAGE_MESSAGES => call_postmessage_messages(arguments),
+        TOOL_POSTMESSAGE_SEND => call_postmessage_send(arguments),
         TOOL_TRACE_START => call_literal(arguments, &["trace", "start"]),
         TOOL_TRACE_STOP => call_optional_one(arguments, &["trace", "stop"], "path"),
         TOOL_PROFILER_START => call_profiler_start(arguments),
@@ -2198,13 +2337,21 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_AUTH_LIST => call_literal(arguments, &["auth", "list"]),
         TOOL_AUTH_SHOW => call_one_string(arguments, "auth show", "name"),
         TOOL_AUTH_DELETE => call_one_string(arguments, "auth delete", "name"),
-        TOOL_STATE_SAVE => call_one_string(arguments, "state save", "path"),
-        TOOL_STATE_LOAD => call_one_string(arguments, "state load", "path"),
+        TOOL_STATE_SAVE => call_state_file(arguments, "save"),
+        TOOL_STATE_LOAD => call_state_file(arguments, "load"),
         TOOL_STATE_LIST => call_literal(arguments, &["state", "list"]),
         TOOL_STATE_CLEAR => call_state_clear(arguments),
         TOOL_STATE_SHOW => call_one_string(arguments, "state show", "path"),
         TOOL_STATE_CLEAN => call_state_clean(arguments),
         TOOL_STATE_RENAME => call_state_rename(arguments),
+        TOOL_STATE_CLONE => call_state_clone(arguments),
+        TOOL_STATE_DIFF => call_state_diff(arguments),
+        TOOL_EVIDENCE_START => call_evidence_start(arguments),
+        TOOL_EVIDENCE_STOP => call_literal(arguments, &["evidence", "stop"]),
+        TOOL_EVIDENCE_STATUS => call_literal(arguments, &["evidence", "status"]),
+        TOOL_EVIDENCE_CAPTURE => call_literal(arguments, &["evidence", "capture"]),
+        TOOL_BROWSER_OWNERS => call_literal(arguments, &["browser", "owners"]),
+        TOOL_BROWSER_LEASE => call_browser_lease(arguments),
         TOOL_TAP => call_simple_selector(arguments, "tap"),
         TOOL_SWIPE => call_swipe(arguments),
         TOOL_DEVICE => call_device(arguments),
@@ -2295,7 +2442,12 @@ fn call_cli_tool(
 ) -> Result<Value, ProtocolError> {
     validate_arguments_object(arguments)?;
     let session = optional_string(arguments, "session")?;
-    let timeout_ms = optional_timeout(arguments)?;
+    let mut timeout_ms = optional_timeout(arguments)?;
+    for key in ["navigationTimeoutMs", "dialogTimeoutMs"] {
+        if let Some(operation_timeout) = optional_u64(arguments, key)? {
+            timeout_ms = timeout_ms.max(operation_timeout.saturating_add(5_000));
+        }
+    }
     let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
 
     let mut cli_args = vec!["--json".to_string()];
@@ -2385,6 +2537,15 @@ fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
             args.push(url);
         }
     }
+    if let Some(wait) = optional_string(arguments, "wait")? {
+        args.extend(["--wait".to_string(), wait]);
+    }
+    if optional_bool(arguments, "returnOnDialog")?.unwrap_or(false) {
+        args.push("--return-on-dialog".to_string());
+    }
+    if let Some(timeout) = optional_u64(arguments, "navigationTimeoutMs")? {
+        args.extend(["--timeout".to_string(), timeout.to_string()]);
+    }
     Ok(args)
 }
 
@@ -2455,6 +2616,9 @@ fn click_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mut args = vec!["click".to_string(), selector];
     if optional_bool(arguments, "newTab")?.unwrap_or(false) {
         args.push("--new-tab".to_string());
+    }
+    if optional_bool(arguments, "noWait")?.unwrap_or(false) {
+        args.push("--no-wait".to_string());
     }
     Ok(args)
 }
@@ -2796,6 +2960,41 @@ fn call_network_route(arguments: &Value) -> Result<Value, ProtocolError> {
         args.push("--resource-type".to_string());
         args.push(resource_type);
     }
+    for (key, flag) in [
+        ("stage", "--stage"),
+        ("rewriteUrl", "--rewrite-url"),
+        ("rewriteMethod", "--rewrite-method"),
+        ("rewriteBody", "--rewrite-body"),
+    ] {
+        if let Some(value) = optional_string(arguments, key)? {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    }
+    if let Some(status) = optional_u64(arguments, "status")? {
+        args.push("--status".to_string());
+        args.push(status.to_string());
+    }
+    for (key, flag) in [
+        ("responseHeaders", "--response-headers"),
+        ("requestHeaders", "--request-headers"),
+    ] {
+        if let Some(headers) = optional_value(arguments, key)? {
+            args.push(flag.to_string());
+            args.push(serde_json::to_string(headers).map_err(|error| {
+                ProtocolError::invalid_params(format!("Invalid {}: {}", key, error))
+            })?);
+        }
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_evidence_start(arguments: &Value) -> Result<Value, ProtocolError> {
+    let path = required_string(arguments, "path")?;
+    let mut args = vec!["evidence".to_string(), "start".to_string(), path];
+    if optional_bool(arguments, "includePrivate")?.unwrap_or(false) {
+        args.push("--include-private".to_string());
+    }
     call_cli_tool(arguments, args, None)
 }
 
@@ -2814,6 +3013,16 @@ fn call_network_requests(arguments: &Value) -> Result<Value, ProtocolError> {
             args.push(flag.to_string());
             args.push(value);
         }
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_network_request(arguments: &Value) -> Result<Value, ProtocolError> {
+    let request_id = required_string(arguments, "requestId")?;
+    let mut args = vec!["network".to_string(), "request".to_string(), request_id];
+    if let Some(path) = optional_string(arguments, "rawOut")? {
+        args.push("--raw-out".to_string());
+        args.push(path);
     }
     call_cli_tool(arguments, args, None)
 }
@@ -2938,6 +3147,74 @@ fn call_clearable(arguments: &Value, command: &str) -> Result<Value, ProtocolErr
     call_cli_tool(arguments, args, None)
 }
 
+fn call_clearable_parts(arguments: &Value, parts: &[&str]) -> Result<Value, ProtocolError> {
+    let mut args: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
+    if optional_bool(arguments, "clear")?.unwrap_or(false) {
+        args.push("--clear".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_dialog_wait(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["dialog".to_string(), "wait".to_string()];
+    if let Some(timeout) = optional_u64(arguments, "dialogTimeoutMs")? {
+        args.push("--timeout".to_string());
+        args.push(timeout.to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_context_new(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["context".to_string(), "new".to_string()];
+    if let Some(path) = optional_string(arguments, "statePath")? {
+        args.extend(["--state".to_string(), path]);
+    }
+    if optional_bool(arguments, "cookiesOnly")?.unwrap_or(false) {
+        args.push("--cookies-only".to_string());
+    }
+    if let Some(url) = optional_string(arguments, "url")? {
+        args.push(url);
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_postmessage_messages(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["postmessage".to_string(), "messages".to_string()];
+    for (key, flag) in [("origin", "--origin"), ("frameId", "--frame")] {
+        if let Some(value) = optional_string(arguments, key)? {
+            args.extend([flag.to_string(), value]);
+        }
+    }
+    if optional_bool(arguments, "clear")?.unwrap_or(false) {
+        args.push("--clear".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_postmessage_send(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["postmessage".to_string(), "send".to_string()];
+    args.extend([
+        "--from-frame".to_string(),
+        required_string(arguments, "fromFrame")?,
+    ]);
+    if let Some(frame) = optional_string(arguments, "toFrame")? {
+        args.extend(["--to-frame".to_string(), frame]);
+    } else if let Some(target) = optional_string(arguments, "target")? {
+        args.extend(["--target".to_string(), target]);
+    }
+    args.extend([
+        "--target-origin".to_string(),
+        required_string(arguments, "targetOrigin")?,
+        "--data".to_string(),
+        serde_json::to_string(
+            optional_value(arguments, "data")?
+                .ok_or_else(|| ProtocolError::invalid_params("data is required"))?,
+        )
+        .map_err(|error| ProtocolError::invalid_params(format!("data is invalid: {}", error)))?,
+    ]);
+    call_cli_tool(arguments, args, None)
+}
+
 fn call_auth_save(arguments: &Value) -> Result<Value, ProtocolError> {
     let name = required_string(arguments, "name")?;
     let url = required_string(arguments, "url")?;
@@ -3003,6 +3280,65 @@ fn call_state_rename(arguments: &Value) -> Result<Value, ProtocolError> {
         ],
         None,
     )
+}
+
+fn push_state_selection_args(
+    arguments: &Value,
+    args: &mut Vec<String>,
+) -> Result<(), ProtocolError> {
+    if optional_bool(arguments, "cookiesOnly")?.unwrap_or(false) {
+        args.push("--cookies-only".to_string());
+    } else if let Some(categories) = optional_string_array(arguments, "categories")? {
+        args.extend(["--categories".to_string(), categories.join(",")]);
+    }
+    Ok(())
+}
+
+fn call_state_file(arguments: &Value, operation: &str) -> Result<Value, ProtocolError> {
+    let mut args = vec![
+        "state".to_string(),
+        operation.to_string(),
+        required_string(arguments, "path")?,
+    ];
+    push_state_selection_args(arguments, &mut args)?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_state_clone(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec![
+        "state".to_string(),
+        "clone".to_string(),
+        required_string(arguments, "source")?,
+        required_string(arguments, "destination")?,
+    ];
+    push_state_selection_args(arguments, &mut args)?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_state_diff(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec![
+        "state".to_string(),
+        "diff".to_string(),
+        required_string(arguments, "left")?,
+        required_string(arguments, "right")?,
+    ];
+    push_state_selection_args(arguments, &mut args)?;
+    if optional_bool(arguments, "showValues")?.unwrap_or(false) {
+        args.push("--show-values".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_browser_lease(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec![
+        "browser".to_string(),
+        "lease".to_string(),
+        required_string(arguments, "operation")?,
+    ];
+    if let Some(profile) = optional_string(arguments, "profile")? {
+        args.push(profile);
+    }
+    call_cli_tool(arguments, args, None)
 }
 
 fn call_session_id(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -3360,11 +3696,17 @@ fn call_chat(arguments: &Value) -> Result<Value, ProtocolError> {
 
 fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
     let script = required_string(arguments, "script")?;
-    call_cli_tool(
-        arguments,
-        vec!["eval".to_string(), "--stdin".to_string()],
-        Some(script),
-    )
+    let mut args = vec!["eval".to_string()];
+    if let Some(frame_id) = optional_string(arguments, "frameId")? {
+        args.extend(["--frame".to_string(), frame_id]);
+        if let Some(world) = optional_string(arguments, "world")? {
+            args.extend(["--world".to_string(), world]);
+        }
+    } else if optional_string(arguments, "world")?.is_some() {
+        return Err(ProtocolError::invalid_params("world requires frameId"));
+    }
+    args.push("--stdin".to_string());
+    call_cli_tool(arguments, args, Some(script))
 }
 
 fn call_close(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -3734,6 +4076,24 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
 
 fn response_text(value: &Value) -> Option<String> {
     if let Some(obj) = value.as_object() {
+        if obj.get("code").and_then(Value::as_str) == Some("navigation_timeout") {
+            let navigation = obj.get("data")?.get("navigation")?;
+            return Some(format!(
+                "Navigation timed out (wait={}, committed={}, browser usable={}).",
+                navigation
+                    .get("wait")
+                    .and_then(Value::as_str)
+                    .unwrap_or("load"),
+                navigation
+                    .get("committed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                navigation
+                    .get("browserUsable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            ));
+        }
         if obj.get("success").and_then(|v| v.as_bool()) == Some(false) {
             return obj
                 .get("error")
@@ -3742,6 +4102,16 @@ fn response_text(value: &Value) -> Option<String> {
         }
 
         if let Some(data) = obj.get("data") {
+            if data.pointer("/navigation/status").and_then(Value::as_str) == Some("dialog") {
+                let message = data
+                    .pointer("/dialog/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                return Some(format!(
+                    "Navigation returned on JavaScript dialog: {}. Resolve it with dialog accept or dialog dismiss.",
+                    message
+                ));
+            }
             // Accessibility reports carry a URL alongside their findings. Use
             // the same report formatter as the CLI before the generic string
             // field fallback turns the MCP text content into only that URL.
@@ -4101,10 +4471,11 @@ mod tests {
         let args = click_command_args(&json!({
             "selector": "@e1",
             "newTab": true,
+            "noWait": true,
         }))
         .unwrap();
 
-        assert_eq!(args, vec!["click", "@e1", "--new-tab"]);
+        assert_eq!(args, vec!["click", "@e1", "--new-tab", "--no-wait"]);
     }
 
     #[test]

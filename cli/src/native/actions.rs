@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -26,6 +26,7 @@ use super::cdp::types::{
 use super::cookies;
 use super::diff;
 use super::element::RefMap;
+use super::evidence::{CollectedEvidence, EvidenceStartOptions, EvidenceState};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -78,6 +79,12 @@ struct ActiveProviderSession {
 #[derive(Clone)]
 pub struct HarEntry {
     pub request_id: String,
+    pub session_id: Option<String>,
+    pub frame_id: Option<String>,
+    pub loader_id: Option<String>,
+    pub document_url: Option<String>,
+    pub initiator: Option<Value>,
+    pub external_references: Option<Value>,
     /// Seconds since Unix epoch (CDP `wallTime`), with sub-second precision.
     pub wall_time: f64,
     // Request fields
@@ -141,9 +148,13 @@ const HAR_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Total budget for embedded bodies across one recording session.
 const HAR_MAX_TOTAL_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RouteEntry {
     pub url_pattern: String,
+    pub stage: String,
     pub response: Option<RouteResponse>,
+    pub request: Option<RouteRequestOverride>,
     pub abort: bool,
     /// When non-empty, only requests whose `resourceType` (as reported by
     /// CDP Fetch.requestPaused) is in this list are matched. Values are
@@ -151,10 +162,21 @@ pub struct RouteEntry {
     pub resource_types: Vec<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RouteResponse {
     pub status: Option<u16>,
     pub body: Option<String>,
     pub content_type: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteRequestOverride {
+    pub url: Option<String>,
+    pub method: Option<String>,
+    pub post_data: Option<String>,
     pub headers: Option<HashMap<String, String>>,
 }
 
@@ -168,6 +190,16 @@ pub struct TrackedRequest {
     pub resource_type: String,
     #[serde(rename = "requestId")]
     pub request_id: String,
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(rename = "frameId", skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    #[serde(rename = "loaderId", skip_serializing_if = "Option::is_none")]
+    pub loader_id: Option<String>,
+    #[serde(rename = "documentUrl", skip_serializing_if = "Option::is_none")]
+    pub document_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Value>,
     #[serde(rename = "postData", skip_serializing_if = "Option::is_none")]
     pub post_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +208,23 @@ pub struct TrackedRequest {
     pub response_headers: Option<Value>,
     #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    #[serde(rename = "externalReferences", skip_serializing_if = "Option::is_none")]
+    pub external_references: Option<Value>,
+}
+
+fn external_network_references(headers: &Value) -> Option<Value> {
+    let headers = headers.as_object()?;
+    let mut references = serde_json::Map::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "x-request-id" | "x-correlation-id" | "request-id" | "traceparent" | "cf-ray"
+        ) {
+            references.insert(name.clone(), value.clone());
+        }
+    }
+    (!references.is_empty()).then_some(Value::Object(references))
 }
 
 pub struct FetchPausedRequest {
@@ -186,6 +235,9 @@ pub struct FetchPausedRequest {
     /// Original request headers from the Fetch.requestPaused event, needed
     /// because Fetch.continueRequest replaces (not merges) headers.
     pub request_headers: Option<serde_json::Map<String, Value>>,
+    pub response_status_code: Option<u16>,
+    pub response_headers: Option<Vec<Value>>,
+    pub network_id: Option<String>,
 }
 
 pub enum BackendType {
@@ -195,6 +247,7 @@ pub enum BackendType {
 
 #[derive(Debug, Clone, Default)]
 pub struct PendingDialog {
+    pub id: u64,
     pub dialog_type: String,
     pub message: String,
     pub url: String,
@@ -202,6 +255,34 @@ pub struct PendingDialog {
     /// Flat CDP session the dialog opened on. A dialog on a background tab
     /// must not block commands targeting the active tab.
     pub session_id: Option<String>,
+    pub frame_id: Option<String>,
+    pub opened_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DialogHistoryEvent {
+    pub id: u64,
+    pub dialog_type: String,
+    pub message: String,
+    pub url: String,
+    pub origin: Option<String>,
+    pub default_prompt: Option<String>,
+    pub session_id: Option<String>,
+    pub frame_id: Option<String>,
+    pub opened_at: u64,
+    pub closed_at: Option<u64>,
+    pub accepted: Option<bool>,
+    pub user_input: Option<String>,
+    pub handling: String,
+    pub open: bool,
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -377,6 +458,7 @@ pub struct DaemonState {
     pub confirm_actions: Option<ConfirmActions>,
     pub inspect_server: Option<InspectServer>,
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
+    pub interception_events: Arc<RwLock<Vec<Value>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
     pub active_frame_id: Option<String>,
@@ -390,6 +472,7 @@ pub struct DaemonState {
     /// Network tracking uses this subset so background-tab iframe traffic is
     /// not mixed into the active tab's request list or HAR capture.
     pub active_iframe_sessions: HashSet<String>,
+    pub owned_browser_contexts: HashSet<String>,
     /// Origin-scoped extra HTTP headers set via `--headers` on navigate.
     /// Key is the origin (scheme + host + port), value is the headers map.
     /// Wrapped in Arc<RwLock<>> so the background Fetch handler can read it.
@@ -407,6 +490,21 @@ pub struct DaemonState {
     pub mouse_state: MouseState,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
+    pub dialog_history: VecDeque<DialogHistoryEvent>,
+    next_dialog_id: u64,
+    pub evidence: Option<EvidenceState>,
+    evidence_console_start: usize,
+    evidence_error_start: usize,
+    evidence_dialog_start: usize,
+    evidence_network_start: usize,
+    evidence_har_start: usize,
+    evidence_started_har: bool,
+    evidence_started_request_tracking: bool,
+    evidence_interception_start: usize,
+    evidence_screenshots: Vec<PathBuf>,
+    evidence_initial_frames: Vec<Value>,
+    evidence_last_dialog_id: Option<u64>,
+    postmessage_monitor: Option<super::postmessage::PostMessageMonitor>,
     /// A mouse button left logically down because a dialog opened between
     /// mousePressed and mouseReleased; released when the dialog is resolved.
     pub pending_pointer_release: Option<super::interaction::PendingRelease>,
@@ -515,21 +613,38 @@ impl DaemonState {
             confirm_actions: ConfirmActions::from_env(),
             inspect_server: None,
             routes: Arc::new(RwLock::new(Vec::new())),
+            interception_events: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
+            owned_browser_contexts: HashSet::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
             proxy_credentials: Arc::new(RwLock::new(None)),
             fetch_handler_task: None,
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
             pending_dialog: None,
+            dialog_history: VecDeque::new(),
+            next_dialog_id: 1,
+            evidence: None,
+            evidence_console_start: 0,
+            evidence_error_start: 0,
+            evidence_dialog_start: 0,
+            evidence_network_start: 0,
+            evidence_har_start: 0,
+            evidence_started_har: false,
+            evidence_started_request_tracking: false,
+            evidence_interception_start: 0,
+            evidence_screenshots: Vec::new(),
+            evidence_initial_frames: Vec::new(),
+            evidence_last_dialog_id: None,
+            postmessage_monitor: None,
             pending_pointer_release: None,
-            auto_dialog: !matches!(
+            auto_dialog: matches!(
                 env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
-                Ok("1" | "true" | "yes")
+                Ok("0" | "false" | "no")
             ),
             stream_client: None,
             stream_server: None,
@@ -623,6 +738,7 @@ impl DaemonState {
         let mut rx = browser.client.subscribe();
         let domain_filter = self.domain_filter.clone();
         let routes = self.routes.clone();
+        let interception_events = self.interception_events.clone();
         let origin_headers = self.origin_headers.clone();
         let proxy_credentials = self.proxy_credentials.clone();
 
@@ -686,7 +802,10 @@ impl DaemonState {
 
                         let df = domain_filter.read().await.clone();
                         let has_proxy_creds = proxy_credentials.read().await.is_some();
-                        let controls_active = df.is_some() || has_proxy_creds;
+                        let controls_active = df.is_some()
+                            || has_proxy_creds
+                            || !routes.read().await.is_empty()
+                            || !origin_headers.read().await.is_empty();
                         let controls_result = if controls_active && target_needs_controls {
                             async {
                                 if let Some(ref target) = target_info {
@@ -719,6 +838,37 @@ impl DaemonState {
                             .await
                         } else {
                             Ok(())
+                        };
+
+                        let controls_result = if controls_result.is_ok() && target_needs_controls {
+                            let routes = routes.read().await;
+                            let origin_headers_active = !origin_headers.read().await.is_empty();
+                            if !routes.is_empty() || origin_headers_active {
+                                let mut patterns: Vec<Value> = routes
+                                    .iter()
+                                    .map(|route| json!({
+                                        "urlPattern": collapse_wildcards(&route.url_pattern),
+                                        "requestStage": if route.stage == "response" { "Response" } else { "Request" },
+                                    }))
+                                    .collect();
+                                if origin_headers_active {
+                                    patterns.push(
+                                        json!({ "urlPattern": "*", "requestStage": "Request" }),
+                                    );
+                                }
+                                client
+                                    .send_command(
+                                        "Fetch.enable",
+                                        Some(json!({ "patterns": patterns, "handleAuthRequests": has_proxy_creds })),
+                                        Some(&sid),
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            controls_result
                         };
 
                         if controls_result.is_ok() {
@@ -770,13 +920,32 @@ impl DaemonState {
                             resource_type,
                             session_id: sid,
                             request_headers,
+                            response_status_code: event
+                                .params
+                                .get("responseStatusCode")
+                                .and_then(Value::as_u64)
+                                .map(|status| status as u16),
+                            response_headers: event
+                                .params
+                                .get("responseHeaders")
+                                .and_then(Value::as_array)
+                                .cloned(),
+                            network_id: event
+                                .params
+                                .get("networkId")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
                         };
 
                         let df = domain_filter.read().await;
                         let rt = routes.read().await;
                         let oh = origin_headers.read().await;
 
-                        resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await;
+                        if let Some(interception) =
+                            resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await
+                        {
+                            interception_events.write().await.push(interception);
+                        }
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1210,12 +1379,9 @@ impl DaemonState {
             let mode = self.har_content_mode;
             let mut to_fetch: Vec<(String, Option<String>)> = Vec::new();
             for (request_id, session_id) in &drained.har_finished_requests {
-                let Some(entry) = self
-                    .har_entries
-                    .iter()
-                    .rev()
-                    .find(|e| &e.request_id == request_id)
-                else {
+                let Some(entry) = self.har_entries.iter().rev().find(|e| {
+                    &e.request_id == request_id && e.session_id.as_ref() == session_id.as_ref()
+                }) else {
                     continue;
                 };
                 if entry.response_body.is_some() {
@@ -1231,7 +1397,7 @@ impl DaemonState {
                 }
             }
 
-            let mut fetched: Vec<(String, String, bool)> = Vec::new();
+            let mut fetched: Vec<(String, String, String, bool)> = Vec::new();
             if let Some(ref mgr) = self.browser {
                 let active_sid = mgr.active_session_id().ok().map(String::from);
                 for (request_id, event_sid) in to_fetch {
@@ -1259,19 +1425,17 @@ impl DaemonState {
                             && self.har_body_total_bytes + body.len() <= HAR_MAX_TOTAL_BODY_BYTES
                         {
                             self.har_body_total_bytes += body.len();
-                            fetched.push((request_id, body.to_string(), base64_encoded));
+                            fetched.push((request_id, sid, body.to_string(), base64_encoded));
                         }
                     }
                 }
             }
 
-            for (request_id, body, base64_encoded) in fetched {
-                if let Some(entry) = self
-                    .har_entries
-                    .iter_mut()
-                    .rev()
-                    .find(|e| e.request_id == request_id)
-                {
+            for (request_id, session_id, body, base64_encoded) in fetched {
+                if let Some(entry) = self.har_entries.iter_mut().rev().find(|e| {
+                    e.request_id == request_id
+                        && e.session_id.as_deref() == Some(session_id.as_str())
+                }) {
                     entry.response_body = Some(body);
                     entry.response_body_base64 = base64_encoded;
                 }
@@ -1280,6 +1444,24 @@ impl DaemonState {
 
         if active_frame_scope_changed {
             self.refresh_active_iframe_sessions().await;
+        }
+        if let (Some(browser), Some(monitor)) =
+            (self.browser.as_ref(), self.postmessage_monitor.as_mut())
+        {
+            if let (Ok(session_id), Ok(target_id)) =
+                (browser.active_session_id(), browser.active_target_id())
+            {
+                if let Ok(graph) = super::security_inspection::collect_frame_graph(
+                    &browser.client,
+                    session_id,
+                    target_id,
+                    &self.iframe_sessions,
+                )
+                .await
+                {
+                    monitor.sync_graph(&browser.client, &graph).await?;
+                }
+            }
         }
 
         Ok(())
@@ -1418,7 +1600,18 @@ impl DaemonState {
                             &self.active_iframe_sessions,
                         );
 
-                    if !session_matches && !iframe_network_event {
+                    let iframe_dialog_event =
+                        matches!(
+                            event.method.as_str(),
+                            "Page.javascriptDialogOpening" | "Page.javascriptDialogClosed"
+                        ) && event.session_id.as_ref().is_some_and(|session_id| {
+                            self.active_iframe_sessions.contains(session_id)
+                                || attached_iframe_sessions
+                                    .iter()
+                                    .any(|(_, attached_session)| attached_session == session_id)
+                        });
+
+                    if !session_matches && !iframe_network_event && !iframe_dialog_event {
                         continue;
                     }
 
@@ -1508,6 +1701,26 @@ impl DaemonState {
                                         .to_string();
                                     self.har_entries.push(HarEntry {
                                         request_id: request_id.clone(),
+                                        session_id: event.session_id.clone(),
+                                        frame_id: event
+                                            .params
+                                            .get("frameId")
+                                            .and_then(Value::as_str)
+                                            .map(ToString::to_string),
+                                        loader_id: event
+                                            .params
+                                            .get("loaderId")
+                                            .and_then(Value::as_str)
+                                            .map(ToString::to_string),
+                                        document_url: event
+                                            .params
+                                            .get("documentURL")
+                                            .and_then(Value::as_str)
+                                            .map(ToString::to_string),
+                                        initiator: event.params.get("initiator").cloned(),
+                                        external_references: request
+                                            .get("headers")
+                                            .and_then(external_network_references),
                                         wall_time,
                                         method: method.clone(),
                                         url: url.clone(),
@@ -1537,10 +1750,7 @@ impl DaemonState {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("Other")
                                         .to_string();
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
+                                    let timestamp = event.received_at_ms;
                                     self.tracked_requests.push(TrackedRequest {
                                         url,
                                         method,
@@ -1548,6 +1758,23 @@ impl DaemonState {
                                         timestamp,
                                         resource_type,
                                         request_id,
+                                        session_id: event.session_id.clone(),
+                                        frame_id: event
+                                            .params
+                                            .get("frameId")
+                                            .and_then(Value::as_str)
+                                            .map(String::from),
+                                        loader_id: event
+                                            .params
+                                            .get("loaderId")
+                                            .and_then(Value::as_str)
+                                            .map(String::from),
+                                        document_url: event
+                                            .params
+                                            .get("documentURL")
+                                            .and_then(Value::as_str)
+                                            .map(String::from),
+                                        initiator: event.params.get("initiator").cloned(),
                                         post_data: request
                                             .get("postData")
                                             .and_then(|v| v.as_str())
@@ -1555,6 +1782,7 @@ impl DaemonState {
                                         status: None,
                                         response_headers: None,
                                         mime_type: None,
+                                        external_references: None,
                                     });
                                 }
                             }
@@ -1596,11 +1824,11 @@ impl DaemonState {
                                     .unwrap_or(-1);
                                 let cdp_timing = response.get("timing").cloned();
                                 if self.har_recording {
-                                    if let Some(entry) = self
-                                        .har_entries
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|e| e.request_id == request_id)
+                                    if let Some(entry) =
+                                        self.har_entries.iter_mut().rev().find(|e| {
+                                            e.request_id == request_id
+                                                && e.session_id == event.session_id
+                                        })
                                     {
                                         entry.status = status;
                                         entry.status_text = status_text;
@@ -1610,6 +1838,10 @@ impl DaemonState {
                                         entry.redirect_url = redirect_url;
                                         entry.response_body_size = encoded_data_length;
                                         entry.cdp_timing = cdp_timing;
+                                        entry.external_references = response
+                                            .get("headers")
+                                            .and_then(external_network_references)
+                                            .or(entry.external_references.take());
                                     }
                                 }
                                 if self.request_tracking {
@@ -1618,15 +1850,18 @@ impl DaemonState {
                                         .get("mimeType")
                                         .and_then(|v| v.as_str())
                                         .map(String::from);
-                                    if let Some(entry) = self
-                                        .tracked_requests
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|e| e.request_id == request_id)
+                                    if let Some(entry) =
+                                        self.tracked_requests.iter_mut().rev().find(|e| {
+                                            e.request_id == request_id
+                                                && e.session_id == event.session_id
+                                        })
                                     {
                                         entry.status = status;
                                         entry.mime_type = resp_mime;
                                         entry.response_headers = resp_headers;
+                                        entry.external_references = response
+                                            .get("headers")
+                                            .and_then(external_network_references);
                                     }
                                 }
                             }
@@ -1642,12 +1877,9 @@ impl DaemonState {
                                 .params
                                 .get("encodedDataLength")
                                 .and_then(|v| v.as_i64());
-                            if let Some(entry) = self
-                                .har_entries
-                                .iter_mut()
-                                .rev()
-                                .find(|e| e.request_id == request_id)
-                            {
+                            if let Some(entry) = self.har_entries.iter_mut().rev().find(|e| {
+                                e.request_id == request_id && e.session_id == event.session_id
+                            }) {
                                 if let Some(ts) = timestamp {
                                     entry.loading_finished_timestamp = Some(ts);
                                 }
@@ -1672,12 +1904,9 @@ impl DaemonState {
                                 .get("errorText")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Failed");
-                            if let Some(entry) = self
-                                .har_entries
-                                .iter_mut()
-                                .rev()
-                                .find(|e| e.request_id == request_id)
-                            {
+                            if let Some(entry) = self.har_entries.iter_mut().rev().find(|e| {
+                                e.request_id == request_id && e.session_id == event.session_id
+                            }) {
                                 if entry.status.is_none() {
                                     entry.status = Some(0);
                                     entry.status_text = error_text.to_string();
@@ -1703,6 +1932,17 @@ impl DaemonState {
                                     event.params.clone(),
                                 )
                             {
+                                let id = self.next_dialog_id;
+                                self.next_dialog_id += 1;
+                                let opened_at = event.received_at_ms;
+                                let frame_id = event
+                                    .params
+                                    .get("frameId")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
+                                let origin = url::Url::parse(&dialog_event.url)
+                                    .ok()
+                                    .map(|url| url.origin().ascii_serialization());
                                 // When auto_dialog is enabled, alert and beforeunload
                                 // dialogs are handled by the background dialog_handler_task.
                                 // Skip tracking them to avoid a stale warning.
@@ -1711,19 +1951,70 @@ impl DaemonState {
                                         dialog_event.dialog_type.as_str(),
                                         "beforeunload" | "alert"
                                     );
+                                self.dialog_history.push_back(DialogHistoryEvent {
+                                    id,
+                                    dialog_type: dialog_event.dialog_type.clone(),
+                                    message: dialog_event.message.clone(),
+                                    url: dialog_event.url.clone(),
+                                    origin,
+                                    default_prompt: dialog_event.default_prompt.clone(),
+                                    session_id: event.session_id.clone(),
+                                    frame_id: frame_id.clone(),
+                                    opened_at,
+                                    closed_at: None,
+                                    accepted: None,
+                                    user_input: None,
+                                    handling: if auto_handled { "auto" } else { "pending" }
+                                        .to_string(),
+                                    open: true,
+                                });
+                                while self.dialog_history.len() > 1000 {
+                                    self.dialog_history.pop_front();
+                                }
                                 if !auto_handled {
                                     self.pending_dialog = Some(PendingDialog {
+                                        id,
                                         dialog_type: dialog_event.dialog_type,
                                         message: dialog_event.message,
                                         url: dialog_event.url,
                                         default_prompt: dialog_event.default_prompt,
                                         session_id: event.session_id.clone(),
+                                        frame_id,
+                                        opened_at,
                                     });
                                 }
                             }
                         }
                         "Page.javascriptDialogClosed" => {
-                            self.pending_dialog = None;
+                            let session_id = event.session_id.as_deref();
+                            if let Some(record) =
+                                self.dialog_history.iter_mut().rev().find(|record| {
+                                    record.open
+                                        && (session_id.is_none()
+                                            || record.session_id.as_deref() == session_id)
+                                })
+                            {
+                                record.open = false;
+                                record.closed_at = Some(event.received_at_ms);
+                                record.accepted = event
+                                    .params
+                                    .get("result")
+                                    .and_then(Value::as_bool)
+                                    .or(record.accepted);
+                                record.user_input = event
+                                    .params
+                                    .get("userInput")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
+                                if record.handling == "pending" {
+                                    record.handling = "external".to_string();
+                                }
+                            }
+                            if self.pending_dialog.as_ref().is_some_and(|dialog| {
+                                session_id.is_none() || dialog.session_id.as_deref() == session_id
+                            }) {
+                                self.pending_dialog = None;
+                            }
                         }
                         // Fetch.requestPaused is handled by the background
                         // fetch_handler_task — no need to collect here.
@@ -1992,6 +2283,11 @@ async fn close_active_provider_session(state: &mut DaemonState) {
 }
 
 pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+    if let Some(monitor) = state.postmessage_monitor.take() {
+        if let Some(browser) = state.browser.as_ref() {
+            let _ = monitor.uninstall(&browser.client).await;
+        }
+    }
     let close_error = if let Some(mut mgr) = state.browser.take() {
         mgr.close().await.err()
     } else {
@@ -2003,7 +2299,20 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
     state.active_iframe_sessions.clear();
+    state.owned_browser_contexts.clear();
     state.screencasting = false;
+    if let Some(pending) = state.pending_dialog.take() {
+        if let Some(entry) = state
+            .dialog_history
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.id == pending.id && entry.open)
+        {
+            entry.open = false;
+            entry.closed_at = Some(unix_time_ms());
+            entry.handling = "connection-ended".to_string();
+        }
+    }
     state.reset_input_state();
     state.update_stream_client().await;
 
@@ -2090,11 +2399,20 @@ fn skip_launch_action(action: &str) -> bool {
             | "state_clear"
             | "state_clean"
             | "state_rename"
+            | "state_clone"
+            | "state_diff"
             | "device_list"
             | "stream_enable"
             | "stream_disable"
             | "stream_status"
             | "session_info"
+            | "browser_owners"
+            | "browser_lease_acquire"
+            | "browser_lease_status"
+            | "browser_lease_release"
+            | "evidence_stop"
+            | "evidence_capture"
+            | "evidence_status"
     )
 }
 
@@ -2152,6 +2470,227 @@ fn policy_actions_for_command(
 }
 
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    let started = std::time::Instant::now();
+    let action = cmd
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut response = execute_command_inner(cmd, state).await;
+    if response.get("success").and_then(Value::as_bool) == Some(true) {
+        if let Some((target_id, url)) = state
+            .browser
+            .as_ref()
+            .and_then(BrowserManager::binding_snapshot)
+        {
+            let force = cmd.get("forceOwnership").and_then(Value::as_bool) == Some(true);
+            let claim = if force {
+                super::browser_ownership::force_claim_target(
+                    &state.session_id,
+                    &target_id,
+                    &url,
+                    current_worker_identity(),
+                )
+            } else {
+                super::browser_ownership::claim_target(
+                    &state.session_id,
+                    &target_id,
+                    &url,
+                    current_worker_identity(),
+                )
+            };
+            match claim {
+                Ok(super::browser_ownership::ClaimOutcome::Refused { conflict }) => {
+                    response = json!({
+                        "id": cmd.get("id").cloned().unwrap_or(Value::Null),
+                        "success": false,
+                        "code": "ownership_conflict",
+                        "error": "The active browser target is owned by another worker",
+                        "data": conflict,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    response = error_response(
+                        cmd.get("id").and_then(Value::as_str).unwrap_or(""),
+                        &format!("Failed to persist browser ownership: {}", error),
+                    );
+                }
+            }
+        }
+    }
+    let dialog_id = state.pending_dialog.as_ref().map(|dialog| dialog.id);
+    let should_capture = state.evidence.is_some()
+        && !action.starts_with("evidence_")
+        && (action == "navigate"
+            || response.get("success").and_then(Value::as_bool) == Some(false)
+            || dialog_id.is_some_and(|id| state.evidence_last_dialog_id != Some(id)));
+    if should_capture {
+        let _ = handle_evidence_capture(state).await;
+        state.evidence_last_dialog_id = dialog_id;
+    }
+    if let Some(evidence) = state.evidence.as_mut() {
+        let error = (response.get("success").and_then(Value::as_bool) == Some(false)).then(|| {
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("command failed")
+                .to_string()
+        });
+        let _ = evidence.record_action(
+            action,
+            cmd.clone(),
+            Some(response.clone()),
+            error,
+            Some(started.elapsed().as_millis() as u64),
+        );
+    }
+    super::evidence::SecretRedactor::for_terminal().redact_json(&response)
+}
+
+fn ownership_targets_for_command(
+    cmd: &Value,
+    state: &DaemonState,
+) -> Result<Vec<(String, String)>, String> {
+    let action = cmd.get("action").and_then(Value::as_str).unwrap_or("");
+    let Some(browser) = state.browser.as_ref() else {
+        return Ok(Vec::new());
+    };
+    match action {
+        "navigate" => Ok(browser.binding_snapshot().into_iter().collect()),
+        "close" => Ok(browser
+            .tab_list()
+            .into_iter()
+            .filter_map(|tab| {
+                Some((
+                    tab.get("targetId")?.as_str()?.to_string(),
+                    tab.get("url")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()),
+        "tab_switch" | "tab_close" => {
+            let tab_id = match cmd.get("tabId").and_then(Value::as_str) {
+                Some(value) => browser.resolve_tab_ref(&super::browser::TabRef::parse(value)?)?,
+                None => {
+                    return Ok(browser.binding_snapshot().into_iter().collect());
+                }
+            };
+            let canonical = super::browser::format_tab_id(tab_id);
+            Ok(browser
+                .tab_list()
+                .into_iter()
+                .find(|tab| tab.get("tabId").and_then(Value::as_str) == Some(&canonical))
+                .and_then(|tab| {
+                    Some((
+                        tab.get("targetId")?.as_str()?.to_string(),
+                        tab.get("url")?.as_str()?.to_string(),
+                    ))
+                })
+                .into_iter()
+                .collect())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn ownership_preflight(cmd: &Value, state: &DaemonState) -> Option<Value> {
+    let action = cmd.get("action").and_then(Value::as_str).unwrap_or("");
+    if !matches!(action, "navigate" | "close" | "tab_switch" | "tab_close") {
+        return None;
+    }
+    let id = cmd.get("id").cloned().unwrap_or(Value::Null);
+    let targets = match ownership_targets_for_command(cmd, state) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return Some(json!({
+                "id": id,
+                "success": false,
+                "code": "ownership_check_failed",
+                "error": error,
+            }));
+        }
+    };
+    let worker = current_worker_identity();
+    let force = cmd.get("forceOwnership").and_then(Value::as_bool) == Some(true);
+
+    if !force {
+        for (target_id, url) in &targets {
+            let request = super::browser_ownership::OwnershipRequest::new(
+                &state.session_id,
+                target_id,
+                url,
+                worker.clone(),
+            );
+            match super::browser_ownership::detect_conflict(&request) {
+                Ok(Some(conflict)) => {
+                    return Some(json!({
+                        "id": id,
+                        "success": false,
+                        "code": "ownership_conflict",
+                        "error": "Refusing to switch, navigate, or close a browser target owned by another worker; pass --force-ownership to override",
+                        "data": conflict,
+                    }));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Some(json!({
+                        "id": id,
+                        "success": false,
+                        "code": "ownership_check_failed",
+                        "error": format!("Failed to read browser ownership: {}", error),
+                    }));
+                }
+            }
+        }
+    }
+
+    // Reserve a target immediately before a destructive command. A switch is
+    // non-destructive and is claimed only after it succeeds. A multi-tab
+    // browser close is conflict-checked as a set because the registry models
+    // one active target per session.
+    if action != "tab_switch" && (targets.len() == 1 || force) {
+        for (target_id, url) in targets {
+            let result = if force {
+                super::browser_ownership::force_claim_target(
+                    &state.session_id,
+                    &target_id,
+                    &url,
+                    worker.clone(),
+                )
+            } else {
+                super::browser_ownership::claim_target(
+                    &state.session_id,
+                    &target_id,
+                    &url,
+                    worker.clone(),
+                )
+            };
+            match result {
+                Ok(super::browser_ownership::ClaimOutcome::Refused { conflict }) => {
+                    return Some(json!({
+                        "id": id,
+                        "success": false,
+                        "code": "ownership_conflict",
+                        "error": "Browser ownership changed while the command was starting",
+                        "data": conflict,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Some(json!({
+                        "id": id,
+                        "success": false,
+                        "code": "ownership_check_failed",
+                        "error": format!("Failed to persist browser ownership: {}", error),
+                    }));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let id = cmd
         .get("id")
@@ -2402,6 +2941,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         );
     }
 
+    if let Some(conflict_response) = ownership_preflight(cmd, state) {
+        return conflict_response;
+    }
+
     // A pending confirm/prompt dialog blocks the renderer's main thread, so
     // any command that touches the page would hang until the client read
     // timeout. Fail fast with instructions instead. Actions in skip_launch
@@ -2438,6 +2981,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     | "tab_new"
                     | "tab_switch"
                     | "tab_close"
+                    | "evidence_stop"
+                    | "evidence_status"
+                    | "evidence_capture"
+                    | "frames_list"
+                    | "frames_tree"
+                    | "frame_inspect"
+                    | "targets_tree"
+                    | "postmessage_messages"
             );
         if on_active_tab && !safe_during_dialog {
             return error_response(
@@ -2450,7 +3001,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    let result = match action {
+    let mut result = match action {
         "launch" => handle_launch(cmd, state).await,
         "navigate" => handle_navigate(cmd, state).await,
         "read" => handle_read(cmd, state).await,
@@ -2496,6 +3047,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "session_info" => handle_session_info(state).await,
         "state_save" => handle_state_save(cmd, state).await,
         "state_load" => handle_state_load(cmd, state).await,
+        "state_clone" => handle_state_clone(cmd),
+        "state_diff" => handle_state_diff(cmd),
         "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
             state::dispatch_state_command(cmd)
                 .expect("dispatch_state_command must handle all state_* actions matched here")
@@ -2512,6 +3065,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "tab_new" => handle_tab_new(cmd, state).await,
         "tab_switch" => handle_tab_switch(cmd, state).await,
         "tab_close" => handle_tab_close(cmd, state).await,
+        "context_new" => handle_context_new(cmd, state).await,
+        "context_list" => handle_context_list(state).await,
+        "context_close" => handle_context_close(cmd, state).await,
         "viewport" => handle_viewport(cmd, state).await,
         "useragent" | "user_agent" => handle_user_agent(cmd, state).await,
         "set_media" => handle_set_media(cmd, state).await,
@@ -2565,6 +3121,24 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "stream_enable" => handle_stream_enable(cmd, state).await,
         "stream_disable" => handle_stream_disable(state).await,
         "stream_status" => handle_stream_status(state).await,
+        "browser_owners" => super::browser_ownership::list().and_then(|owners| {
+            serde_json::to_value(owners)
+                .map_err(|error| format!("Failed to serialize browser owners: {}", error))
+        }),
+        "browser_lease_acquire" => handle_browser_lease(cmd, state, "acquire"),
+        "browser_lease_status" => handle_browser_lease(cmd, state, "status"),
+        "browser_lease_release" => handle_browser_lease(cmd, state, "release"),
+        "frames_list" | "frames_tree" => handle_frames(state).await,
+        "frame_inspect" => handle_frame_inspect(cmd, state).await,
+        "targets_tree" => handle_targets(state).await,
+        "postmessage_monitor_start" => handle_postmessage_monitor_start(state).await,
+        "postmessage_monitor_stop" => handle_postmessage_monitor_stop(state).await,
+        "postmessage_messages" => handle_postmessage_messages(cmd, state),
+        "postmessage_send" => handle_postmessage_send(cmd, state).await,
+        "evidence_start" => handle_evidence_start(cmd, state).await,
+        "evidence_stop" => handle_evidence_stop(state).await,
+        "evidence_status" => handle_evidence_status(state),
+        "evidence_capture" => handle_evidence_capture(state).await,
         "waitforurl" => handle_waitforurl(cmd, state).await,
         "waitforloadstate" => handle_waitforloadstate(cmd, state).await,
         "waitforfunction" => handle_waitforfunction(cmd, state).await,
@@ -2619,6 +3193,23 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
+    // Controlled navigation consumes its own CDP subscription so it can
+    // return before a blocking dialog. Drain the daemon subscription before
+    // restore validation, otherwise validation may touch the renderer while
+    // that dialog is still open.
+    let returned_on_dialog = action == "navigate"
+        && result
+            .as_ref()
+            .ok()
+            .and_then(|data| data.pointer("/navigation/status"))
+            .and_then(Value::as_str)
+            == Some("dialog");
+    if returned_on_dialog {
+        if let Err(error) = state.drain_cdp_events_background().await {
+            result = Err(error);
+        }
+    }
+
     if result.is_ok() && should_validate_restore_after_action(action) {
         validate_restore_if_pending(state).await;
     }
@@ -2640,6 +3231,19 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     };
 
     let mut resp = match result {
+        Ok(data)
+            if action == "navigate"
+                && data.pointer("/navigation/status").and_then(Value::as_str)
+                    == Some("timeout") =>
+        {
+            let mut response = error_response(
+                &id,
+                "Navigation timed out; partial browser state is available in data",
+            );
+            response["code"] = json!("navigation_timeout");
+            response["data"] = data;
+            response
+        }
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
@@ -4631,7 +5235,16 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
-    let result = mgr.navigate(url, wait_until).await?;
+    let result = mgr
+        .navigate_controlled(
+            url,
+            wait_until,
+            cmd.get("returnOnDialog")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            cmd.get("timeout").and_then(Value::as_u64),
+        )
+        .await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
@@ -4780,6 +5393,32 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
         .and_then(|v| v.as_str())
         .ok_or("Missing 'script' parameter")?;
 
+    if let Some(frame_id) = cmd.get("frameId").and_then(Value::as_str) {
+        let graph = super::security_inspection::collect_frame_graph(
+            &mgr.client,
+            mgr.active_session_id()?,
+            mgr.active_target_id()?,
+            &state.iframe_sessions,
+        )
+        .await?;
+        let world = match cmd.get("world").and_then(Value::as_str).unwrap_or("main") {
+            "main" => super::security_inspection::FrameWorld::Main,
+            "isolated" => super::security_inspection::FrameWorld::default(),
+            value => return Err(format!("Unsupported frame world: {}", value)),
+        };
+        let result = super::security_inspection::evaluate_in_frame(
+            &mgr.client,
+            &graph,
+            frame_id,
+            script,
+            world,
+            true,
+        )
+        .await?;
+        return serde_json::to_value(result)
+            .map_err(|error| format!("Failed to serialize frame evaluation: {}", error));
+    }
+
     let result = mgr.evaluate(script, None).await?;
     let url = mgr.get_url().await.unwrap_or_default();
     Ok(json!({ "result": result, "origin": url }))
@@ -4787,6 +5426,13 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     let save_result = auto_save_restore_state(state).await;
+    if let (Some(monitor), Some(browser)) =
+        (state.postmessage_monitor.take(), state.browser.as_ref())
+    {
+        let _ = monitor.uninstall(&browser.client).await;
+    }
+    let _ =
+        super::browser_ownership::release_session(&state.session_id, &current_worker_identity());
     close_all_browser_backends(state).await?;
 
     // Stop background Fetch handler
@@ -5068,7 +5714,12 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
         if defer_url_until_controls {
             let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-            mgr.navigate(&href, WaitUntil::Load).await?;
+            let wait = if cmd.get("noWait").and_then(Value::as_bool) == Some(true) {
+                WaitUntil::None
+            } else {
+                WaitUntil::Load
+            };
+            mgr.navigate(&href, wait).await?;
         }
 
         return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
@@ -5966,13 +6617,15 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
     let session_id = mgr.active_session_id()?.to_string();
     let path = cmd.get("path").and_then(|v| v.as_str());
 
-    let saved_path = state::save_state(
+    let selection = state_selection_from_command(cmd)?;
+    let saved_path = state::save_state_selected(
         &mgr.client,
         &session_id,
         path,
         state.session_name.as_deref(),
         &state.session_id,
         mgr.visited_origins(),
+        selection,
     )
     .await?;
 
@@ -5988,9 +6641,675 @@ async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .ok_or("Missing 'path' parameter")?;
 
     ensure_state_replay_supported_by_active_domain_filter(state, "state load").await?;
-    state::load_state(&mgr.client, &session_id, path).await?;
+    let selection = state_selection_from_command(cmd)?;
+    state::load_state_selected(&mgr.client, &session_id, path, selection).await?;
     mark_explicit_storage_state_loaded(state, path);
     Ok(json!({ "loaded": true, "path": path }))
+}
+
+fn state_selection_from_command(cmd: &Value) -> Result<state::StateSelection, String> {
+    let Some(raw) = cmd.get("categories").and_then(Value::as_str) else {
+        return Ok(state::StateSelection::default());
+    };
+    let mut categories = Vec::new();
+    for value in raw.split(',') {
+        categories.push(match value.trim() {
+            "cookies" => state::StateCategory::Cookies,
+            "local-storage" => state::StateCategory::LocalStorage,
+            "session-storage" => state::StateCategory::SessionStorage,
+            other => return Err(format!("Unsupported state category: {}", other)),
+        });
+    }
+    Ok(state::StateSelection::from_categories(&categories))
+}
+
+fn current_worker_identity() -> super::browser_ownership::WorkerIdentity {
+    let worker_id = [
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "GROK_SESSION_ID",
+        "CI_JOB_ID",
+    ]
+    .iter()
+    .find_map(|key| env::var(key).ok().filter(|value| !value.trim().is_empty()))
+    .unwrap_or_else(|| format!("pid-{}", std::process::id()));
+    super::browser_ownership::WorkerIdentity::for_current_process(worker_id)
+}
+
+async fn active_frame_graph(
+    state: &DaemonState,
+) -> Result<super::security_inspection::FrameGraph, String> {
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let mut graph = super::security_inspection::collect_frame_graph(
+        &browser.client,
+        browser.active_session_id()?,
+        browser.active_target_id()?,
+        &state.iframe_sessions,
+    )
+    .await?;
+    if let Some(dialog) = state.pending_dialog.as_ref() {
+        if let Some(frame_id) = dialog.frame_id.as_deref() {
+            if let Some(frame) = graph
+                .frames
+                .iter_mut()
+                .find(|frame| frame.frame_id == frame_id)
+            {
+                frame.paused_by_dialog = true;
+            }
+        }
+    }
+    Ok(graph)
+}
+
+async fn handle_frames(state: &DaemonState) -> Result<Value, String> {
+    serde_json::to_value(active_frame_graph(state).await?)
+        .map_err(|error| format!("Failed to serialize frame graph: {}", error))
+}
+
+async fn handle_frame_inspect(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let frame_id = cmd
+        .get("frameId")
+        .and_then(Value::as_str)
+        .ok_or("Missing frame ID")?;
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let mut result = super::security_inspection::inspect_frame(
+        &browser.client,
+        browser.active_session_id()?,
+        browser.active_target_id()?,
+        &state.iframe_sessions,
+        frame_id,
+    )
+    .await?;
+    result.frame.paused_by_dialog = state
+        .pending_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.frame_id.as_deref())
+        == Some(frame_id);
+    serde_json::to_value(result)
+        .map_err(|error| format!("Failed to serialize frame inspection: {}", error))
+}
+
+async fn handle_targets(state: &DaemonState) -> Result<Value, String> {
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let graph = super::security_inspection::collect_target_graph(&browser.client).await?;
+    serde_json::to_value(graph)
+        .map_err(|error| format!("Failed to serialize target graph: {}", error))
+}
+
+async fn handle_postmessage_monitor_start(state: &mut DaemonState) -> Result<Value, String> {
+    if state.postmessage_monitor.is_some() {
+        return Err("PostMessage monitor is already active".to_string());
+    }
+    let graph = active_frame_graph(state).await?;
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let monitor = super::postmessage::install_postmessage_monitor(
+        &browser.client,
+        &graph,
+        super::postmessage::PostMessageMonitorOptions::default(),
+    )
+    .await?;
+    let installations = monitor.installations.len();
+    state.postmessage_monitor = Some(monitor);
+    Ok(json!({ "active": true, "installations": installations }))
+}
+
+async fn handle_postmessage_monitor_stop(state: &mut DaemonState) -> Result<Value, String> {
+    let monitor = state
+        .postmessage_monitor
+        .take()
+        .ok_or("PostMessage monitor is not active")?;
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    serde_json::to_value(monitor.uninstall(&browser.client).await?)
+        .map_err(|error| format!("Failed to serialize PostMessage history: {}", error))
+}
+
+fn handle_postmessage_messages(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let monitor = state
+        .postmessage_monitor
+        .as_mut()
+        .ok_or("PostMessage monitor is not active")?;
+    monitor.drain_new();
+    let origin = cmd.get("origin").and_then(Value::as_str);
+    let frame_id = cmd.get("frameId").and_then(Value::as_str);
+    let events: Vec<_> = monitor
+        .history
+        .events
+        .iter()
+        .filter(|event| origin.is_none_or(|value| event.payload.origin == value))
+        .filter(|event| {
+            frame_id.is_none_or(|value| event.receiver_frame_id.as_deref() == Some(value))
+        })
+        .cloned()
+        .collect();
+    let result = json!({
+        "events": events,
+        "droppedCdpEvents": monitor.history.dropped_cdp_events,
+        "parseErrors": monitor.history.parse_errors,
+    });
+    if cmd.get("clear").and_then(Value::as_bool) == Some(true) {
+        monitor.history.events.clear();
+        monitor.history.parse_errors.clear();
+        monitor.history.dropped_cdp_events = 0;
+    }
+    Ok(result)
+}
+
+async fn handle_postmessage_send(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let source_frame_id = cmd
+        .get("fromFrame")
+        .and_then(Value::as_str)
+        .ok_or("Missing source frame ID")?;
+    let target_origin = cmd
+        .get("targetOrigin")
+        .and_then(Value::as_str)
+        .ok_or("Missing target origin")?;
+    let raw_data = if let Some(path) = cmd.get("dataFile").and_then(Value::as_str) {
+        fs::read_to_string(path).map_err(|error| format!("Failed to read data file: {}", error))?
+    } else {
+        cmd.get("data")
+            .and_then(Value::as_str)
+            .ok_or("Missing PostMessage data")?
+            .to_string()
+    };
+    let message = serde_json::from_str(&raw_data)
+        .map_err(|error| format!("PostMessage data must be valid JSON: {}", error))?;
+    let target = if let Some(frame_id) = cmd.get("toFrame").and_then(Value::as_str) {
+        super::postmessage::PostMessageTarget::FrameId(frame_id.to_string())
+    } else {
+        match cmd.get("target").and_then(Value::as_str).unwrap_or("self") {
+            "self" => super::postmessage::PostMessageTarget::SelfFrame,
+            "parent" => super::postmessage::PostMessageTarget::Parent,
+            "top" => super::postmessage::PostMessageTarget::Top,
+            "opener" => super::postmessage::PostMessageTarget::Opener,
+            value => return Err(format!("Unsupported PostMessage target: {}", value)),
+        }
+    };
+    let graph = active_frame_graph(state).await?;
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let result = super::postmessage::send_postmessage(
+        &browser.client,
+        &graph,
+        source_frame_id,
+        target,
+        &message,
+        target_origin,
+        super::security_inspection::FrameWorld::Main,
+    )
+    .await?;
+    serde_json::to_value(result)
+        .map_err(|error| format!("Failed to serialize PostMessage result: {}", error))
+}
+
+async fn handle_evidence_capture(state: &mut DaemonState) -> Result<Value, String> {
+    if !state
+        .evidence
+        .as_ref()
+        .ok_or("Evidence capture is not active")?
+        .includes_private()
+    {
+        let reason = "Screenshot capture requires evidence start --include-private because pixels cannot be safely redacted";
+        return Ok(json!({ "captured": false, "reason": reason }));
+    }
+    let bundle_id = state
+        .evidence
+        .as_ref()
+        .ok_or("Evidence capture is not active")?
+        .bundle_id()
+        .to_string();
+    let path = env::temp_dir().join(format!(
+        "agent-browser-evidence-{}-{}.png",
+        bundle_id,
+        unix_time_ms()
+    ));
+    let result = handle_screenshot(
+        &json!({ "path": path.to_string_lossy(), "fullPage": true }),
+        state,
+    )
+    .await;
+    match result {
+        Ok(_) => {
+            state.evidence_screenshots.push(path.clone());
+            Ok(json!({ "captured": true, "path": path }))
+        }
+        Err(error) => {
+            if let Some(evidence) = state.evidence.as_mut() {
+                let _ = evidence.add_gap(super::evidence::EvidenceGap::new(
+                    "screenshot",
+                    error.clone(),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn handle_evidence_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.evidence.is_some() {
+        return Err("Evidence capture is already active".to_string());
+    }
+    let path = cmd
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("Missing evidence output directory")?;
+    let mut options = EvidenceStartOptions::new(path);
+    options.include_private = cmd
+        .get("includePrivate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let browser_metadata = if let Some(browser) = state.browser.as_ref() {
+        browser
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    options.metadata = json!({
+        "session": state.session_id,
+        "targetId": state.browser.as_ref().and_then(|browser| browser.active_target_id().ok()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "browser": browser_metadata,
+    });
+    state.evidence = Some(EvidenceState::start(options)?);
+    state.evidence_console_start = state.event_tracker.console_entries.len();
+    state.evidence_error_start = state.event_tracker.error_entries.len();
+    state.evidence_dialog_start = state.dialog_history.len();
+    state.evidence_network_start = state.tracked_requests.len();
+    state.evidence_har_start = state.har_entries.len();
+    state.evidence_started_har = !state.har_recording;
+    state.evidence_interception_start = state.interception_events.read().await.len();
+    state.evidence_screenshots.clear();
+    state.evidence_initial_frames = active_frame_graph(state)
+        .await
+        .ok()
+        .and_then(|graph| serde_json::to_value(graph).ok())
+        .map(|graph| vec![json!({ "phase": "start", "graph": graph })])
+        .unwrap_or_default();
+    state.evidence_last_dialog_id = state.pending_dialog.as_ref().map(|dialog| dialog.id);
+    state.evidence_started_request_tracking = !state.request_tracking;
+    state.request_tracking = true;
+    if let Some(browser) = state.browser.as_ref() {
+        let network_enable_params = json!({
+            "maxTotalBufferSize": 100_000_000,
+            "maxResourceBufferSize": 10_000_000,
+        });
+        browser
+            .client
+            .send_command(
+                "Network.enable",
+                Some(network_enable_params.clone()),
+                Some(browser.active_session_id()?),
+            )
+            .await?;
+        for iframe_session in &state.active_iframe_sessions {
+            let _ = browser
+                .client
+                .send_command(
+                    "Network.enable",
+                    Some(network_enable_params.clone()),
+                    Some(iframe_session),
+                )
+                .await;
+        }
+        state.har_recording = true;
+        state.har_content_mode = HarContentMode::Text;
+    }
+    let capture = handle_evidence_capture(state).await;
+    let status = state
+        .evidence
+        .as_ref()
+        .expect("evidence just started")
+        .status();
+    Ok(json!({ "status": status, "initialScreenshot": capture.ok() }))
+}
+
+fn handle_evidence_status(state: &DaemonState) -> Result<Value, String> {
+    match state.evidence.as_ref() {
+        Some(evidence) => serde_json::to_value(evidence.status()),
+        None => Ok(json!({ "active": false })),
+    }
+    .map_err(|error| format!("Failed to serialize evidence status: {}", error))
+}
+
+async fn handle_evidence_stop(state: &mut DaemonState) -> Result<Value, String> {
+    if state.evidence.is_none() {
+        return Err("Evidence capture is not active".to_string());
+    }
+    state.drain_cdp_events_background().await?;
+    let _ = handle_evidence_capture(state).await;
+    let dialogs = state
+        .dialog_history
+        .iter()
+        .skip(state.evidence_dialog_start)
+        .filter_map(|entry| serde_json::to_value(entry).ok())
+        .collect();
+    let console = state
+        .event_tracker
+        .get_console_json()
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|entries| entries[state.evidence_console_start.min(entries.len())..].to_vec())
+        .unwrap_or_default();
+    let errors = state
+        .event_tracker
+        .get_errors_json()
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|entries| entries[state.evidence_error_start.min(entries.len())..].to_vec())
+        .unwrap_or_default();
+    let network = state.tracked_requests[state
+        .evidence_network_start
+        .min(state.tracked_requests.len())..]
+        .iter()
+        .filter_map(|entry| serde_json::to_value(entry).ok())
+        .collect::<Vec<_>>();
+    let har_entries: Vec<Value> = state.har_entries
+        [state.evidence_har_start.min(state.har_entries.len())..]
+        .iter()
+        .cloned()
+        .map(har_entry_to_json)
+        .collect();
+    let mut har_log = json!({
+        "version": "1.2",
+        "creator": {
+            "name": "agent-browser",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "entries": har_entries,
+    });
+    if let Some(browser) = har_browser_metadata(state).await {
+        har_log["browser"] = browser;
+    }
+    let har = json!({ "log": har_log });
+    let routes = state.routes.read().await.clone();
+    let interception_events = state.interception_events.read().await;
+    let interception_events = interception_events[state
+        .evidence_interception_start
+        .min(interception_events.len())..]
+        .to_vec();
+    let interceptions = vec![json!({
+        "rules": routes,
+        "events": interception_events,
+        "modifiedTraffic": !interception_events.is_empty(),
+    })];
+    let mut frames = state.evidence_initial_frames.clone();
+    frames.extend(
+        active_frame_graph(state)
+            .await
+            .ok()
+            .and_then(|graph| serde_json::to_value(graph).ok())
+            .map(|graph| json!({ "phase": "stop", "graph": graph })),
+    );
+    if let Some(browser) = state.browser.as_ref() {
+        let version = browser
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .ok();
+        let command_line = browser
+            .client
+            .send_command_no_params("Browser.getBrowserCommandLine", None)
+            .await
+            .ok();
+        frames.push(json!({ "browser": version, "commandLine": command_line }));
+    }
+    let screenshots = state.evidence_screenshots.clone();
+    let mut collected = CollectedEvidence::from_values(
+        dialogs,
+        console,
+        errors,
+        network,
+        frames,
+        screenshots.clone(),
+    );
+    collected.har = Some(har);
+    collected.interceptions = interceptions;
+    let manifest = state
+        .evidence
+        .as_mut()
+        .expect("evidence checked above")
+        .stop(collected)?;
+    state.evidence = None;
+    for path in screenshots {
+        let _ = fs::remove_file(path);
+    }
+    state.evidence_screenshots.clear();
+    state.evidence_initial_frames.clear();
+    state.evidence_last_dialog_id = None;
+    if state.evidence_started_har {
+        state.har_recording = false;
+        state
+            .har_entries
+            .truncate(state.evidence_har_start.min(state.har_entries.len()));
+        state.har_body_total_bytes = 0;
+    }
+    state.evidence_har_start = 0;
+    state.evidence_started_har = false;
+    if state.evidence_started_request_tracking {
+        state.request_tracking = false;
+    }
+    state.evidence_started_request_tracking = false;
+    state.evidence_interception_start = 0;
+    serde_json::to_value(manifest)
+        .map_err(|error| format!("Failed to serialize evidence manifest: {}", error))
+}
+
+async fn handle_context_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let client = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .client
+        .clone();
+    let context = client
+        .send_command(
+            "Target.createBrowserContext",
+            Some(json!({ "disposeOnDetach": true })),
+            None,
+        )
+        .await?;
+    let context_id = context
+        .get("browserContextId")
+        .and_then(Value::as_str)
+        .ok_or("Target.createBrowserContext returned no browserContextId")?
+        .to_string();
+    let setup = async {
+        let target = client
+            .send_command(
+                "Target.createTarget",
+                Some(json!({ "url": "about:blank", "browserContextId": context_id })),
+                None,
+            )
+            .await?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or("Target.createTarget returned no targetId")?
+            .to_string();
+        let attached: AttachToTargetResult = client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        state
+            .browser
+            .as_mut()
+            .ok_or("Browser not launched")?
+            .prepare_domains_pub(&attached.session_id)
+            .await?;
+        Ok::<_, String>((target_id, attached.session_id))
+    }
+    .await;
+    let (target_id, session_id) = match setup {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = client
+                .send_command(
+                    "Target.disposeBrowserContext",
+                    Some(json!({ "browserContextId": context_id })),
+                    None,
+                )
+                .await;
+            return Err(error);
+        }
+    };
+    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+    let setup = async {
+        install_network_controls_or_resume_prepared_session(state, has_proxy_creds, &session_id)
+            .await?;
+        if let Some(path) = cmd.get("statePath").and_then(Value::as_str) {
+            let selection = if cmd.get("cookiesOnly").and_then(Value::as_bool) == Some(true) {
+                state::StateSelection::cookies_only()
+            } else {
+                state::StateSelection::default()
+            };
+            state::load_state_selected(&client, &session_id, path, selection).await?;
+        }
+        let browser = state.browser.as_mut().ok_or("Browser not launched")?;
+        let tab_id = browser.assign_tab_id();
+        browser.add_page(super::browser::PageInfo {
+            tab_id,
+            label: None,
+            target_id: target_id.clone(),
+            session_id: session_id.clone(),
+            url: "about:blank".to_string(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        });
+        if let Some(url) = cmd.get("url").and_then(Value::as_str) {
+            browser.navigate(url, WaitUntil::Commit).await?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = setup {
+        if let Some(browser) = state.browser.as_mut() {
+            browser.remove_page_by_target_id(&target_id);
+        }
+        let _ = client
+            .send_command(
+                "Target.disposeBrowserContext",
+                Some(json!({ "browserContextId": context_id })),
+                None,
+            )
+            .await;
+        return Err(error);
+    }
+    state.owned_browser_contexts.insert(context_id.clone());
+    Ok(json!({
+        "browserContextId": context_id,
+        "targetId": target_id,
+        "sessionId": session_id,
+    }))
+}
+
+async fn handle_context_list(state: &DaemonState) -> Result<Value, String> {
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let targets = super::security_inspection::collect_target_graph(&browser.client).await?;
+    let mut context_ids: Vec<_> = state.owned_browser_contexts.iter().cloned().collect();
+    context_ids.sort();
+    let targets: Vec<_> = targets
+        .targets
+        .into_iter()
+        .filter(|target| {
+            target
+                .browser_context_id
+                .as_ref()
+                .is_some_and(|id| state.owned_browser_contexts.contains(id))
+        })
+        .collect();
+    Ok(json!({
+        "browserContextIds": context_ids,
+        "targets": targets,
+    }))
+}
+
+async fn handle_context_close(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let context_id = cmd
+        .get("contextId")
+        .and_then(Value::as_str)
+        .ok_or("Missing browser context ID")?;
+    if !state.owned_browser_contexts.contains(context_id)
+        && cmd.get("forceOwnership").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("Refusing to close a browser context not created by this session; pass --force-ownership to override".to_string());
+    }
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    browser
+        .client
+        .send_command(
+            "Target.disposeBrowserContext",
+            Some(json!({ "browserContextId": context_id })),
+            None,
+        )
+        .await?;
+    state.drain_cdp_events_background().await?;
+    state.owned_browser_contexts.remove(context_id);
+    Ok(json!({ "browserContextId": context_id, "closed": true }))
+}
+
+fn handle_browser_lease(
+    cmd: &Value,
+    state: &DaemonState,
+    operation: &str,
+) -> Result<Value, String> {
+    let raw_profile = cmd.get("profile").and_then(Value::as_str);
+    let profile = if raw_profile == Some("default") {
+        None
+    } else {
+        super::browser_lease::normalize_profile_identity(raw_profile)?
+    };
+    let identity = super::browser_lease::LeaseIdentity::new(
+        state.session_id.clone(),
+        profile,
+        current_worker_identity(),
+    );
+    let value = match operation {
+        "acquire" => serde_json::to_value(super::browser_lease::acquire_default(identity)?),
+        "release" => serde_json::to_value(super::browser_lease::release(&identity)?),
+        _ => serde_json::to_value(super::browser_lease::status(&identity)?),
+    };
+    value.map_err(|error| format!("Failed to serialize browser lease: {}", error))
+}
+
+fn handle_state_clone(cmd: &Value) -> Result<Value, String> {
+    let source = cmd
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or("Missing source")?;
+    let destination = cmd
+        .get("destination")
+        .and_then(Value::as_str)
+        .ok_or("Missing destination")?;
+    let path =
+        state::clone_state_file_filtered(source, destination, state_selection_from_command(cmd)?)?;
+    Ok(json!({ "cloned": true, "path": path }))
+}
+
+fn handle_state_diff(cmd: &Value) -> Result<Value, String> {
+    let left = cmd
+        .get("left")
+        .and_then(Value::as_str)
+        .ok_or("Missing left state")?;
+    let right = cmd
+        .get("right")
+        .and_then(Value::as_str)
+        .ok_or("Missing right state")?;
+    serde_json::to_value(state::diff_state_files(
+        left,
+        right,
+        state_selection_from_command(cmd)?,
+        cmd.get("showValues")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )?)
+    .map_err(|error| format!("Failed to serialize state diff: {}", error))
 }
 
 // ---------------------------------------------------------------------------
@@ -6243,7 +7562,24 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 
 async fn handle_tab_list(state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let tabs = mgr.tab_list();
+    let mut tabs = mgr.tab_list();
+    let owners = super::browser_ownership::list()?;
+    for tab in &mut tabs {
+        let target_id = tab.get("targetId").and_then(Value::as_str);
+        let owner = target_id.and_then(|target_id| {
+            owners
+                .iter()
+                .find(|owner| owner.target_id.eq_ignore_ascii_case(target_id))
+        });
+        if let Some(object) = tab.as_object_mut() {
+            object.insert(
+                "owner".to_string(),
+                owner
+                    .and_then(|owner| serde_json::to_value(owner).ok())
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
     Ok(json!({ "tabs": tabs }))
 }
 
@@ -6346,15 +7682,31 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
 }
 
 async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let tab_id = {
+    let (tab_id, target_id) = {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-        match cmd.get("tabId").and_then(|v| v.as_str()) {
+        let tab_id = match cmd.get("tabId").and_then(|v| v.as_str()) {
             Some(s) => {
                 let tab_ref = super::browser::TabRef::parse(s)?;
                 Some(mgr.resolve_tab_ref(&tab_ref)?)
             }
             None => None,
-        }
+        };
+        let target_id = match tab_id {
+            Some(tab_id) => {
+                let canonical = super::browser::format_tab_id(tab_id);
+                mgr.tab_list().into_iter().find_map(|tab| {
+                    (tab.get("tabId").and_then(Value::as_str) == Some(canonical.as_str()))
+                        .then(|| {
+                            tab.get("targetId")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                        })
+                        .flatten()
+                })
+            }
+            None => mgr.binding_snapshot().map(|(target_id, _)| target_id),
+        };
+        (tab_id, target_id)
     };
     let dialog_session = state
         .pending_dialog
@@ -6371,6 +7723,13 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
     state.refresh_active_iframe_sessions().await;
+    if let Some(target_id) = target_id {
+        let _ = super::browser_ownership::release(
+            &state.session_id,
+            &target_id,
+            &current_worker_identity(),
+        );
+    }
     Ok(result)
 }
 
@@ -7258,14 +8617,80 @@ async fn handle_permissions(cmd: &Value, state: &DaemonState) -> Result<Value, S
 async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let response = cmd.get("response").and_then(|v| v.as_str());
 
+    if response == Some("history") {
+        let events = serde_json::to_value(&state.dialog_history)
+            .map_err(|error| format!("Failed to serialize dialog history: {}", error))?;
+        if cmd.get("clear").and_then(Value::as_bool).unwrap_or(false) {
+            state.dialog_history.retain(|event| event.open);
+        }
+        return Ok(json!({ "events": events }));
+    }
+
+    if response == Some("wait") {
+        let (client, active_session) = {
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+            (mgr.client.clone(), mgr.active_session_id()?.to_string())
+        };
+        let mut events = client.subscribe();
+        state.drain_cdp_events_background().await?;
+        if let Some(dialog) = &state.pending_dialog {
+            return Ok(json!({
+                "hasDialog": true,
+                "id": dialog.id,
+                "type": dialog.dialog_type,
+                "message": dialog.message,
+                "url": dialog.url,
+                "frameId": dialog.frame_id,
+                "openedAt": dialog.opened_at,
+            }));
+        }
+        let active_iframe_sessions = state.active_iframe_sessions.clone();
+        let timeout = tokio::time::Duration::from_millis(
+            cmd.get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(state.default_timeout_ms),
+        );
+        return tokio::time::timeout(timeout, async move {
+            loop {
+                match events.recv().await {
+                    Ok(event)
+                        if event.method == "Page.javascriptDialogOpening"
+                            && (event.session_id.as_deref() == Some(active_session.as_str())
+                                || event.session_id.as_ref().is_some_and(|session_id| {
+                                    active_iframe_sessions.contains(session_id)
+                                })) =>
+                    {
+                        return Ok(json!({
+                            "hasDialog": true,
+                            "type": event.params.get("type").cloned().unwrap_or(Value::Null),
+                            "message": event.params.get("message").cloned().unwrap_or(Value::Null),
+                            "url": event.params.get("url").cloned().unwrap_or(Value::Null),
+                            "frameId": event.params.get("frameId").cloned().unwrap_or(Value::Null),
+                        }));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("Dialog event stream closed".to_string())
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for a JavaScript dialog".to_string())?;
+    }
+
     // dialog status — return pending dialog info
     if response == Some("status") {
         return Ok(match &state.pending_dialog {
             Some(dialog) => {
                 let mut obj = json!({
                     "hasDialog": true,
+                    "id": dialog.id,
                     "type": dialog.dialog_type,
                     "message": dialog.message,
+                    "url": dialog.url,
+                    "frameId": dialog.frame_id,
+                    "openedAt": dialog.opened_at,
                 });
                 if let Some(ref prompt) = dialog.default_prompt {
                     obj["defaultPrompt"] = json!(prompt);
@@ -7286,8 +8711,31 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // Clear tracked state even if Chrome reports no dialog (e.g. it was
     // already resolved and the closed event was missed); otherwise a stale
     // pending_dialog would make every page command fail fast forever.
-    let result = mgr.handle_dialog(accept, prompt_text).await;
-    state.pending_dialog = None;
+    let pending_id = state.pending_dialog.as_ref().map(|dialog| dialog.id);
+    let pending_session = state
+        .pending_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.session_id.as_deref());
+    let result = if let Some(session_id) = pending_session {
+        mgr.handle_dialog_in_session(session_id, accept, prompt_text)
+            .await
+    } else {
+        mgr.handle_dialog(accept, prompt_text).await
+    };
+    if result.is_ok() {
+        if let Some(record) = state
+            .dialog_history
+            .iter_mut()
+            .find(|record| Some(record.id) == pending_id)
+        {
+            record.open = false;
+            record.closed_at = Some(unix_time_ms());
+            record.accepted = Some(accept);
+            record.user_input = prompt_text.map(String::from);
+            record.handling = "manual".to_string();
+        }
+        state.pending_dialog = None;
+    }
     result?;
 
     // If a click's mousedown opened this dialog, the button is still logically
@@ -9586,6 +11034,12 @@ async fn handle_video_stop(state: &mut DaemonState) -> Result<Value, String> {
 
 /// Begin capturing network traffic for a later HAR export.
 async fn handle_har_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.evidence.is_some() {
+        return Err(
+            "Evidence capture owns the HAR boundary; stop evidence before starting a manual HAR"
+                .to_string(),
+        );
+    }
     let content_mode = match cmd.get("content").and_then(|v| v.as_str()) {
         Some(s) => HarContentMode::parse(s)?,
         None => HarContentMode::default(),
@@ -9627,6 +11081,12 @@ async fn handle_har_start(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
 /// Stop HAR recording and write the captured requests to disk.
 async fn handle_har_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.evidence.is_some() {
+        return Err(
+            "Evidence capture owns the HAR boundary; stop evidence before stopping its HAR"
+                .to_string(),
+        );
+    }
     let path = har_output_path(cmd.get("path").and_then(|v| v.as_str()));
 
     state.har_recording = false;
@@ -9758,6 +11218,13 @@ fn har_entry_to_json(e: HarEntry) -> Value {
         "cache": {},
         "timings": timings,
         "_resourceType": e.resource_type,
+        "_browserRequestId": e.request_id,
+        "_sessionId": e.session_id,
+        "_frameId": e.frame_id,
+        "_loaderId": e.loader_id,
+        "_documentUrl": e.document_url,
+        "_initiator": e.initiator,
+        "_externalReferences": e.external_references,
     })
 }
 
@@ -10079,7 +11546,7 @@ async fn resolve_fetch_paused(
     routes: &[RouteEntry],
     origin_headers: &HashMap<String, HashMap<String, String>>,
     paused: &FetchPausedRequest,
-) {
+) -> Option<Value> {
     let session_id = &paused.session_id;
 
     // Domain filter check (takes priority over routes and origin headers)
@@ -10108,7 +11575,7 @@ async fn resolve_fetch_paused(
                         )
                         .await;
                 }
-                return;
+                return None;
             }
 
             if let Some(hostname) = parsed.host_str() {
@@ -10148,11 +11615,13 @@ async fn resolve_fetch_paused(
                             )
                             .await;
                     }
-                    return;
+                    return None;
                 }
             }
         }
     }
+
+    let response_stage = paused.response_status_code.is_some();
 
     // Route matching
     for route in routes {
@@ -10164,7 +11633,8 @@ async fn resolve_fetch_paused(
                 .iter()
                 .any(|rt| rt.eq_ignore_ascii_case(&paused.resource_type));
 
-        let matches = url_matches && resource_type_matches;
+        let stage_matches = (route.stage == "response") == response_stage;
+        let matches = url_matches && resource_type_matches && stage_matches;
 
         if matches {
             if route.abort {
@@ -10178,25 +11648,94 @@ async fn resolve_fetch_paused(
                         Some(session_id),
                     )
                     .await;
-                return;
+                return Some(json!({
+                    "timestamp": unix_time_ms(),
+                    "browserRequestId": paused.network_id.as_deref().unwrap_or(&paused.request_id),
+                    "fetchRequestId": paused.request_id,
+                    "sessionId": paused.session_id,
+                    "rule": route.url_pattern,
+                    "stage": route.stage,
+                    "outcome": "aborted",
+                    "modifiedTraffic": true,
+                }));
             }
 
             if let Some(ref resp) = route.response {
-                let status = resp.status.unwrap_or(200);
-                let body_str = resp.body.as_deref().unwrap_or("");
-                let encoded = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    body_str.as_bytes(),
-                );
-                let mut headers = vec![];
+                let status = resp.status.or(paused.response_status_code).unwrap_or(200);
+                let body_result = if let Some(body) = resp.body.as_ref() {
+                    Some((body.clone(), false))
+                } else if response_stage {
+                    client
+                        .send_command(
+                            "Fetch.getResponseBody",
+                            Some(json!({ "requestId": paused.request_id })),
+                            Some(session_id),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|result| {
+                            result.get("body").and_then(Value::as_str).map(|body| {
+                                (
+                                    body.to_string(),
+                                    result
+                                        .get("base64Encoded")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                )
+                            })
+                        })
+                } else {
+                    Some((String::new(), false))
+                };
+                let Some((body_str, body_is_base64)) = body_result else {
+                    let _ = client
+                        .send_command(
+                            "Fetch.continueRequest",
+                            Some(json!({ "requestId": paused.request_id })),
+                            Some(session_id),
+                        )
+                        .await;
+                    return Some(json!({
+                        "timestamp": unix_time_ms(),
+                        "browserRequestId": paused.network_id.as_deref().unwrap_or(&paused.request_id),
+                        "fetchRequestId": paused.request_id,
+                        "sessionId": paused.session_id,
+                        "rule": route.url_pattern,
+                        "stage": route.stage,
+                        "outcome": "response_body_unavailable",
+                        "modifiedTraffic": false,
+                    }));
+                };
+                let encoded = if body_is_base64 {
+                    body_str
+                } else {
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        body_str.as_bytes(),
+                    )
+                };
+                let mut headers = paused.response_headers.clone().unwrap_or_default();
                 if let Some(ct) = &resp.content_type {
+                    headers.retain(|header| {
+                        !header
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case("content-type"))
+                    });
                     headers.push(json!({ "name": "Content-Type", "value": ct }));
                 }
                 if let Some(h) = &resp.headers {
                     for (k, v) in h {
+                        headers.retain(|header| {
+                            !header
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| name.eq_ignore_ascii_case(k))
+                        });
                         headers.push(json!({ "name": k, "value": v }));
                     }
                 }
+                headers.push(json!({ "name": "X-Agent-Browser-Modified", "value": route.stage }));
 
                 let _ = client
                     .send_command(
@@ -10210,7 +11749,62 @@ async fn resolve_fetch_paused(
                         Some(session_id),
                     )
                     .await;
-                return;
+                return Some(json!({
+                    "timestamp": unix_time_ms(),
+                    "browserRequestId": paused.network_id.as_deref().unwrap_or(&paused.request_id),
+                    "fetchRequestId": paused.request_id,
+                    "sessionId": paused.session_id,
+                    "rule": route.url_pattern,
+                    "stage": route.stage,
+                    "outcome": if response_stage { "response_modified" } else { "response_fulfilled" },
+                    "changedFields": ["status", "headers", "body"],
+                    "modifiedTraffic": true,
+                }));
+            }
+
+            if let Some(ref request_override) = route.request {
+                let mut params = json!({ "requestId": paused.request_id });
+                if let Some(url) = &request_override.url {
+                    params["url"] = json!(url);
+                }
+                if let Some(method) = &request_override.method {
+                    params["method"] = json!(method);
+                }
+                if let Some(post_data) = &request_override.post_data {
+                    params["postData"] = json!(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        post_data.as_bytes()
+                    ));
+                }
+                if let Some(overrides) = &request_override.headers {
+                    let mut headers = Vec::new();
+                    if let Some(original) = &paused.request_headers {
+                        for (name, value) in original {
+                            if !overrides.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                                headers.push(json!({ "name": name, "value": value }));
+                            }
+                        }
+                    }
+                    for (name, value) in overrides {
+                        headers.push(json!({ "name": name, "value": value }));
+                    }
+                    headers.push(json!({ "name": "X-Agent-Browser-Modified", "value": "request" }));
+                    params["headers"] = Value::Array(headers);
+                }
+                let _ = client
+                    .send_command("Fetch.continueRequest", Some(params), Some(session_id))
+                    .await;
+                return Some(json!({
+                    "timestamp": unix_time_ms(),
+                    "browserRequestId": paused.network_id.as_deref().unwrap_or(&paused.request_id),
+                    "fetchRequestId": paused.request_id,
+                    "sessionId": paused.session_id,
+                    "rule": route.url_pattern,
+                    "stage": "request",
+                    "outcome": "request_modified",
+                    "changedFields": ["url", "method", "headers", "postData"],
+                    "modifiedTraffic": true,
+                }));
             }
         }
     }
@@ -10253,6 +11847,7 @@ async fn resolve_fetch_paused(
             )
             .await;
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -10266,7 +11861,12 @@ async fn build_fetch_patterns(state: &DaemonState) -> Vec<Value> {
     let routes = state.routes.read().await;
     let mut patterns: Vec<Value> = routes
         .iter()
-        .map(|r| json!({ "urlPattern": collapse_wildcards(&r.url_pattern) }))
+        .map(|r| {
+            json!({
+                "urlPattern": collapse_wildcards(&r.url_pattern),
+                "requestStage": if r.stage == "response" { "Response" } else { "Request" },
+            })
+        })
         .collect();
     let has_domain_filter = state.domain_filter.read().await.is_some();
     let has_origin_headers = !state.origin_headers.read().await.is_empty();
@@ -10324,6 +11924,37 @@ fn parse_route_response(cmd: &Value) -> Option<RouteResponse> {
         })
 }
 
+fn parse_route_request(cmd: &Value) -> Option<RouteRequestOverride> {
+    let value = cmd.get("request")?;
+    Some(RouteRequestOverride {
+        url: value
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        method: value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        post_data: value
+            .get("postData")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        headers: value
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                    })
+                    .collect()
+            }),
+    })
+}
+
 async fn handle_route(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -10357,12 +11988,20 @@ async fn handle_route(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .unwrap_or_default();
 
     let response = parse_route_response(cmd);
+    let request = parse_route_request(cmd);
+    let stage = cmd
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("request")
+        .to_string();
 
     {
         let mut routes = state.routes.write().await;
         routes.push(RouteEntry {
             url_pattern: url_pattern.clone(),
+            stage,
             response,
+            request,
             abort,
             resource_types,
         });
@@ -10371,8 +12010,14 @@ async fn handle_route(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let patterns = build_fetch_patterns(state).await;
     let params = build_fetch_enable_params(state, patterns).await;
     mgr.client
-        .send_command("Fetch.enable", Some(params), Some(&session_id))
+        .send_command("Fetch.enable", Some(params.clone()), Some(&session_id))
         .await?;
+    for iframe_session in &state.active_iframe_sessions {
+        let _ = mgr
+            .client
+            .send_command("Fetch.enable", Some(params.clone()), Some(iframe_session))
+            .await;
+    }
 
     Ok(json!({ "routed": url_pattern }))
 }
@@ -10400,11 +12045,23 @@ async fn handle_unroute(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         mgr.client
             .send_command("Fetch.disable", None, Some(&session_id))
             .await?;
+        for iframe_session in &state.active_iframe_sessions {
+            let _ = mgr
+                .client
+                .send_command("Fetch.disable", None, Some(iframe_session))
+                .await;
+        }
     } else {
         let params = build_fetch_enable_params(state, patterns).await;
         mgr.client
-            .send_command("Fetch.enable", Some(params), Some(&session_id))
+            .send_command("Fetch.enable", Some(params.clone()), Some(&session_id))
             .await?;
+        for iframe_session in &state.active_iframe_sessions {
+            let _ = mgr
+                .client
+                .send_command("Fetch.enable", Some(params.clone()), Some(iframe_session))
+                .await;
+        }
     }
 
     let label = url.unwrap_or("all");
@@ -10493,16 +12150,27 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or("Missing 'requestId' parameter")?;
 
-    let entry = state
+    let matching: Vec<_> = state
         .tracked_requests
         .iter()
-        .find(|r| r.request_id == request_id)
-        .ok_or("Request not found")?;
+        .filter(|request| request.request_id == request_id)
+        .collect();
+    if matching.len() > 1 {
+        return Err(format!(
+            "Request ID {} exists in multiple CDP sessions; use the session-qualified ID shown by network requests",
+            request_id
+        ));
+    }
+    let entry = matching.into_iter().next().ok_or("Request not found")?;
+    let request_session_id = entry.session_id.clone();
 
     let mut result = serde_json::to_value(entry).unwrap_or(json!({}));
 
     if let Some(ref mgr) = state.browser {
-        if let Ok(session_id) = mgr.active_session_id() {
+        if let Some(session_id) = request_session_id
+            .as_deref()
+            .or_else(|| mgr.active_session_id().ok())
+        {
             if let Ok(body_result) = mgr
                 .client
                 .send_command(
@@ -10529,7 +12197,56 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
         }
     }
 
+    if let Some(path) = cmd.get("rawOut").and_then(Value::as_str) {
+        let url = url::Url::parse(&entry.url)
+            .map_err(|error| format!("Cannot reconstruct raw request URL: {}", error))?;
+        let mut target = url.path().to_string();
+        if let Some(query) = url.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        let mut raw = format!("{} {} HTTP/1.1\r\n", entry.method, target);
+        if !entry
+            .headers
+            .as_object()
+            .is_some_and(|headers| headers.keys().any(|name| name.eq_ignore_ascii_case("host")))
+        {
+            raw.push_str(&format!("Host: {}\r\n", url.host_str().unwrap_or_default()));
+        }
+        if let Some(headers) = entry.headers.as_object() {
+            for (name, value) in headers {
+                raw.push_str(name);
+                raw.push_str(": ");
+                raw.push_str(value.as_str().unwrap_or_default());
+                raw.push_str("\r\n");
+            }
+        }
+        raw.push_str("\r\n");
+        if let Some(body) = &entry.post_data {
+            raw.push_str(body);
+        }
+        write_private_output(Path::new(path), raw.as_bytes())?;
+        result["rawOut"] = json!(path);
+        result["rawOutKind"] = json!("cdp-reconstruction");
+    }
+
     Ok(result)
+}
+
+fn write_private_output(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Failed to create {}: {}", path.display(), error))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
 }
 
 async fn handle_http_credentials(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -12048,11 +13765,14 @@ mod tests {
     fn test_autosave_blocked_while_dialog_open() {
         let mut state = DaemonState::new();
         state.pending_dialog = Some(PendingDialog {
+            id: 1,
             dialog_type: "confirm".to_string(),
             message: "Are you sure?".to_string(),
             url: "https://example.com".to_string(),
             default_prompt: None,
             session_id: None,
+            frame_id: None,
+            opened_at: unix_time_ms(),
         });
         assert!(!autosave_due(&state, 30_000));
     }
@@ -14101,6 +15821,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         // wall_time: 2026-03-15T12:00:00Z = 1_773_576_000
         let entry = HarEntry {
             request_id: "req-1".to_string(),
+            session_id: None,
+            frame_id: None,
+            loader_id: None,
+            document_url: None,
+            initiator: None,
+            external_references: None,
             wall_time: 1773576000.0,
             method: "POST".to_string(),
             url: "https://example.com/api?foo=bar&baz=qux".to_string(),
@@ -14165,6 +15891,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     fn test_har_entry_to_json_embeds_response_body() {
         let mut entry = HarEntry {
             request_id: "req-2".to_string(),
+            session_id: None,
+            frame_id: None,
+            loader_id: None,
+            document_url: None,
+            initiator: None,
+            external_references: None,
             wall_time: 1773576000.0,
             method: "GET".to_string(),
             url: "https://example.com/api/items".to_string(),
@@ -14258,6 +15990,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     fn test_har_set_cookie_strips_attributes_before_equal_split() {
         let entry = HarEntry {
             request_id: "r".to_string(),
+            session_id: None,
+            frame_id: None,
+            loader_id: None,
+            document_url: None,
+            initiator: None,
+            external_references: None,
             wall_time: 1773576000.0,
             method: "GET".to_string(),
             url: "https://example.com/".to_string(),
@@ -14318,6 +16056,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         state.har_recording = true;
         state.har_entries.push(HarEntry {
             request_id: "req-2".to_string(),
+            session_id: None,
+            frame_id: None,
+            loader_id: None,
+            document_url: None,
+            initiator: None,
+            external_references: None,
             wall_time: 1773576000.0,
             method: "GET".to_string(),
             url: "https://example.com/".to_string(),
@@ -14367,6 +16111,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let mut state = DaemonState::new();
         state.har_entries.push(HarEntry {
             request_id: "req-3".to_string(),
+            session_id: None,
+            frame_id: None,
+            loader_id: None,
+            document_url: None,
+            initiator: None,
+            external_references: None,
             wall_time: 1773576000.0,
             method: "GET".to_string(),
             url: "https://example.com/".to_string(),
@@ -14557,6 +16307,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let mut routes = state.routes.write().await;
             routes.push(super::RouteEntry {
                 url_pattern: "https://example.com/*".to_string(),
+                stage: "request".to_string(),
+                request: None,
                 response: None,
                 abort: true,
                 resource_types: Vec::new(),
@@ -14619,6 +16371,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let mut routes = state.routes.write().await;
             routes.push(super::RouteEntry {
                 url_pattern: "**/api/users".to_string(),
+                stage: "request".to_string(),
+                request: None,
                 response: None,
                 abort: true,
                 resource_types: Vec::new(),
@@ -14698,6 +16452,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let mut routes = state.routes.write().await;
             routes.push(super::RouteEntry {
                 url_pattern: "*".to_string(),
+                stage: "request".to_string(),
+                request: None,
                 response: None,
                 abort: false,
                 resource_types: Vec::new(),
@@ -14791,11 +16547,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     }
 
     #[tokio::test]
-    async fn test_auto_dialog_enabled_by_default() {
+    async fn test_dialogs_preserved_by_default() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
         std::env::remove_var("AGENT_BROWSER_NO_AUTO_DIALOG");
         let state = DaemonState::new();
-        assert!(state.auto_dialog, "auto_dialog should be true by default");
+        assert!(!state.auto_dialog, "auto_dialog should be false by default");
         drop(guard);
     }
 
@@ -14824,13 +16580,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     }
 
     #[tokio::test]
-    async fn test_auto_dialog_not_disabled_by_random_value() {
+    async fn test_auto_dialog_can_be_enabled_by_false_env() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
         guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "no");
         let state = DaemonState::new();
         assert!(
             state.auto_dialog,
-            "auto_dialog should remain true for non-truthy env values"
+            "auto_dialog should be true when dialog preservation is explicitly disabled"
         );
         drop(guard);
     }

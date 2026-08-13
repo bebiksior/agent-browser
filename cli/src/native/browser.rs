@@ -329,6 +329,7 @@ pub fn is_valid_label(s: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitUntil {
+    Commit,
     Load,
     DomContentLoaded,
     NetworkIdle,
@@ -338,6 +339,7 @@ pub enum WaitUntil {
 impl WaitUntil {
     pub fn from_str(s: &str) -> Self {
         match s {
+            "commit" => Self::Commit,
             "domcontentloaded" => Self::DomContentLoaded,
             "networkidle" => Self::NetworkIdle,
             "none" => Self::None,
@@ -1085,8 +1087,13 @@ impl BrowserManager {
         // If loader_id is None, it was a same-document navigation (e.g., hash routing)
         // which does not fire Page.loadEventFired or Page.domContentEventFired.
         if nav_result.loader_id.is_some() && wait_until != WaitUntil::None {
-            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
-                .await?;
+            if wait_until == WaitUntil::Commit {
+                self.wait_for_commit(&session_id, &nav_result.frame_id, &mut lifecycle_rx)
+                    .await?;
+            } else {
+                self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+                    .await?;
+            }
         }
 
         let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
@@ -1112,6 +1119,158 @@ impl BrowserManager {
         Ok(json!({ "url": page_url, "title": title, "targetId": target_id }))
     }
 
+    pub async fn navigate_controlled(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+        return_on_dialog: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, String> {
+        let timeout_ms = timeout_ms.unwrap_or(self.default_timeout_ms);
+        let previous_timeout = self.default_timeout_ms;
+        self.default_timeout_ms = timeout_ms.saturating_add(1_000);
+        let result = self
+            .navigate_controlled_inner(url, wait_until, return_on_dialog, timeout_ms)
+            .await;
+        self.default_timeout_ms = previous_timeout;
+        result
+    }
+
+    async fn navigate_controlled_inner(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+        return_on_dialog: bool,
+        timeout_ms: u64,
+    ) -> Result<Value, String> {
+        let target_id = self.active_target_id()?.to_string();
+
+        if !return_on_dialog {
+            return match tokio::time::timeout(
+                tokio::time::Duration::from_millis(timeout_ms),
+                self.navigate(url, wait_until),
+            )
+            .await
+            {
+                Ok(result) => result.map(|mut value| {
+                    value["navigation"] = json!({
+                        "status": "completed",
+                        "wait": format!("{:?}", wait_until).to_ascii_lowercase(),
+                        "committed": wait_until != WaitUntil::None,
+                        "browserUsable": true,
+                    });
+                    value
+                }),
+                Err(_) => Ok(json!({
+                    "url": url,
+                    "targetId": target_id,
+                    "navigation": {
+                        "status": "timeout",
+                        "wait": format!("{:?}", wait_until).to_ascii_lowercase(),
+                        "timedOut": true,
+                        "committed": false,
+                        "browserUsable": true,
+                    }
+                })),
+            };
+        }
+
+        let active_session = self.active_session_id()?.to_string();
+        let mut events = self.client.subscribe();
+        let deadline = tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms));
+        tokio::pin!(deadline);
+        let navigation = self.navigate(url, wait_until);
+        tokio::pin!(navigation);
+
+        let mut committed = false;
+        let mut navigation_iframe_sessions = std::collections::HashSet::new();
+        loop {
+            tokio::select! {
+                result = &mut navigation => {
+                    return result.map(|mut value| {
+                        value["navigation"] = json!({
+                            "status": "completed",
+                            "wait": format!("{:?}", wait_until).to_ascii_lowercase(),
+                            "committed": wait_until != WaitUntil::None,
+                            "browserUsable": true,
+                        });
+                        value
+                    });
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(event) if event.method == "Page.javascriptDialogOpening"
+                            && (event.session_id.as_deref() == Some(active_session.as_str())
+                                || event.session_id.as_ref().is_some_and(|session_id| navigation_iframe_sessions.contains(session_id))) => {
+                            return Ok(json!({
+                                "url": event.params.get("url").and_then(Value::as_str).unwrap_or(url),
+                                "targetId": target_id,
+                                "navigation": {
+                                    "status": "dialog",
+                                    "wait": format!("{:?}", wait_until).to_ascii_lowercase(),
+                                    "committed": committed,
+                                    "browserUsable": true,
+                                },
+                                "dialog": {
+                                    "type": event.params.get("type").cloned().unwrap_or(Value::Null),
+                                    "message": event.params.get("message").cloned().unwrap_or(Value::Null),
+                                    "url": event.params.get("url").cloned().unwrap_or(Value::Null),
+                                    "frameId": event.params.get("frameId").cloned().unwrap_or(Value::Null),
+                                }
+                            }));
+                        }
+                        Ok(event) => {
+                            if event.method == "Target.attachedToTarget"
+                                && event.params.pointer("/targetInfo/type").and_then(Value::as_str)
+                                    == Some("iframe")
+                            {
+                                if let Some(session_id) = event
+                                    .params
+                                    .get("sessionId")
+                                    .and_then(Value::as_str)
+                                {
+                                    navigation_iframe_sessions.insert(session_id.to_string());
+                                }
+                            }
+                            if event.method == "Target.detachedFromTarget" {
+                                if let Some(session_id) = event
+                                    .params
+                                    .get("sessionId")
+                                    .and_then(Value::as_str)
+                                {
+                                    navigation_iframe_sessions.remove(session_id);
+                                }
+                            }
+                            if event.method == "Page.frameNavigated"
+                                && event.session_id.as_deref() == Some(active_session.as_str())
+                                && event.params.pointer("/frame/parentId").is_none()
+                            {
+                                committed = true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err("Event stream closed during navigation".to_string());
+                        }
+                    }
+                }
+                _ = &mut deadline => {
+                    return Ok(json!({
+                        "url": url,
+                        "targetId": target_id,
+                        "navigation": {
+                            "status": "timeout",
+                            "wait": format!("{:?}", wait_until).to_ascii_lowercase(),
+                            "timedOut": true,
+                            "committed": committed,
+                            "browserUsable": true,
+                        }
+                    }));
+                }
+            }
+        }
+    }
+
     async fn wait_for_lifecycle(
         &self,
         wait_until: WaitUntil,
@@ -1119,6 +1278,7 @@ impl BrowserManager {
         rx: &mut broadcast::Receiver<CdpEvent>,
     ) -> Result<(), String> {
         let event_name = match wait_until {
+            WaitUntil::Commit => return Ok(()),
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
             WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
@@ -1145,6 +1305,35 @@ impl BrowserManager {
         })
         .await
         .map_err(|_| format!("Timeout waiting for {}", event_name))?
+    }
+
+    async fn wait_for_commit(
+        &self,
+        session_id: &str,
+        frame_id: &str,
+        rx: &mut broadcast::Receiver<CdpEvent>,
+    ) -> Result<(), String> {
+        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        tokio::time::timeout(timeout, async {
+            loop {
+                match rx.recv().await {
+                    Ok(event)
+                        if event.method == "Page.frameNavigated"
+                            && event.session_id.as_deref() == Some(session_id)
+                            && event.params.pointer("/frame/id").and_then(Value::as_str)
+                                == Some(frame_id) =>
+                    {
+                        return Ok(())
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("Event stream closed".to_string())
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Timeout waiting for navigation commit".to_string())?
     }
 
     async fn wait_for_network_idle(
@@ -1226,7 +1415,7 @@ impl BrowserManager {
             WaitUntil::DomContentLoaded => Some("document.readyState !== 'loading'"),
             // Network idle is tracked from live network events; its poller
             // already treats a quiet stream as idle.
-            WaitUntil::NetworkIdle | WaitUntil::None => None,
+            WaitUntil::Commit | WaitUntil::NetworkIdle | WaitUntil::None => None,
         };
         if let Some(expression) = already_reached {
             let probe: Result<EvaluateResult, String> = self
@@ -1884,6 +2073,16 @@ impl BrowserManager {
         prompt_text: Option<&str>,
     ) -> Result<(), String> {
         let session_id = self.active_session_id()?;
+        self.handle_dialog_in_session(session_id, accept, prompt_text)
+            .await
+    }
+
+    pub async fn handle_dialog_in_session(
+        &self,
+        session_id: &str,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<(), String> {
         let mut params = json!({ "accept": accept });
         if let Some(text) = prompt_text {
             params["promptText"] = Value::String(text.to_string());
@@ -2805,6 +3004,7 @@ mod tests {
             method: method.to_string(),
             params,
             session_id: Some(session_id.to_string()),
+            received_at_ms: 0,
         }
     }
 

@@ -564,6 +564,8 @@ pub fn format_console_args(args: &[Value]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ConsoleEntry {
+    pub sequence: u64,
+    pub timestamp: u64,
     pub level: String,
     pub text: String,
     pub args: Vec<Value>,
@@ -571,6 +573,8 @@ pub struct ConsoleEntry {
 
 #[derive(Debug, Clone)]
 pub struct ErrorEntry {
+    pub sequence: u64,
+    pub timestamp: u64,
     pub text: String,
     pub url: Option<String>,
     pub line: Option<i64>,
@@ -581,6 +585,7 @@ pub struct EventTracker {
     pub console_entries: Vec<ConsoleEntry>,
     pub error_entries: Vec<ErrorEntry>,
     pub max_entries: usize,
+    next_sequence: u64,
 }
 
 impl EventTracker {
@@ -589,6 +594,7 @@ impl EventTracker {
             console_entries: Vec::new(),
             error_entries: Vec::new(),
             max_entries: 1000,
+            next_sequence: 1,
         }
     }
 
@@ -596,7 +602,11 @@ impl EventTracker {
         if self.console_entries.len() >= self.max_entries {
             self.console_entries.remove(0);
         }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         self.console_entries.push(ConsoleEntry {
+            sequence,
+            timestamp: event_timestamp_ms(),
             level: level.to_string(),
             text: text.to_string(),
             args,
@@ -613,7 +623,11 @@ impl EventTracker {
         if self.error_entries.len() >= self.max_entries {
             self.error_entries.remove(0);
         }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         self.error_entries.push(ErrorEntry {
+            sequence,
+            timestamp: event_timestamp_ms(),
             text: text.to_string(),
             url: url.map(String::from),
             line,
@@ -630,7 +644,12 @@ impl EventTracker {
             .console_entries
             .iter()
             .map(|e| {
-                let mut msg = json!({ "type": e.level, "text": e.text });
+                let mut msg = json!({
+                    "sequence": e.sequence,
+                    "timestamp": e.timestamp,
+                    "type": e.level,
+                    "text": e.text,
+                });
                 if !e.args.is_empty() {
                     msg.as_object_mut()
                         .unwrap()
@@ -648,6 +667,8 @@ impl EventTracker {
             .iter()
             .map(|e| {
                 json!({
+                    "sequence": e.sequence,
+                    "timestamp": e.timestamp,
                     "text": e.text,
                     "url": e.url,
                     "line": e.line,
@@ -657,6 +678,13 @@ impl EventTracker {
             .collect();
         json!({ "errors": entries })
     }
+}
+
+fn event_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

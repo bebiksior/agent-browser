@@ -7,6 +7,10 @@ pub mod auth;
 #[allow(dead_code)]
 pub mod browser;
 #[allow(dead_code)]
+pub mod browser_lease;
+#[allow(dead_code)]
+pub mod browser_ownership;
+#[allow(dead_code)]
 pub mod cdp;
 #[allow(dead_code)]
 pub mod cookies;
@@ -17,6 +21,8 @@ pub mod diff;
 #[allow(dead_code)]
 pub mod element;
 #[allow(dead_code)]
+pub mod evidence;
+#[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]
 pub mod interaction;
@@ -25,6 +31,8 @@ pub mod network;
 #[allow(dead_code)]
 pub mod policy;
 #[allow(dead_code)]
+pub mod postmessage;
+#[allow(dead_code)]
 pub mod providers;
 #[allow(dead_code)]
 pub mod react;
@@ -32,6 +40,8 @@ pub mod react;
 pub mod recording;
 #[allow(dead_code)]
 pub mod screenshot;
+#[allow(dead_code)]
+pub mod security_inspection;
 #[allow(dead_code)]
 pub mod snapshot;
 #[allow(dead_code)]

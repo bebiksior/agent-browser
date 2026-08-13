@@ -572,10 +572,16 @@ async fn test_tracked_request_struct() {
         timestamp: 12345,
         resource_type: "Document".to_string(),
         request_id: "1.1".to_string(),
+        session_id: Some("session-1".to_string()),
+        frame_id: Some("frame-1".to_string()),
+        loader_id: Some("loader-1".to_string()),
+        document_url: Some("https://example.com/".to_string()),
+        initiator: Some(json!({"type": "parser"})),
         post_data: None,
         status: Some(200),
         response_headers: None,
         mime_type: Some("text/html".to_string()),
+        external_references: None,
     };
     let serialized = serde_json::to_value(&tr).unwrap();
     assert_eq!(serialized["url"], "https://example.com/api");
@@ -597,10 +603,16 @@ async fn test_request_tracking_state() {
         timestamp: 1,
         resource_type: "Document".to_string(),
         request_id: "1.1".to_string(),
+        session_id: None,
+        frame_id: None,
+        loader_id: None,
+        document_url: None,
+        initiator: None,
         post_data: None,
         status: None,
         response_headers: None,
         mime_type: None,
+        external_references: None,
     });
     state.tracked_requests.push(super::actions::TrackedRequest {
         url: "https://other.com".to_string(),
@@ -609,10 +621,16 @@ async fn test_request_tracking_state() {
         timestamp: 2,
         resource_type: "XHR".to_string(),
         request_id: "1.2".to_string(),
+        session_id: None,
+        frame_id: None,
+        loader_id: None,
+        document_url: None,
+        initiator: None,
         post_data: None,
         status: None,
         response_headers: None,
         mime_type: None,
+        external_references: None,
     });
     assert_eq!(state.tracked_requests.len(), 2);
 

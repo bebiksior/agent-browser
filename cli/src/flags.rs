@@ -359,6 +359,7 @@ pub struct Flags {
     pub device: Option<String>,
     pub auto_connect: bool,
     pub pin_tab: bool,
+    pub force_ownership: bool,
     pub session_name: Option<String>,
     pub annotate: bool,
     pub color_scheme: Option<String>,
@@ -375,6 +376,9 @@ pub struct Flags {
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>, // Canonical milliseconds string for AGENT_BROWSER_IDLE_TIMEOUT_MS
     pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
+    /// Per-command timeout from `--timeout`; never participates in the daemon
+    /// launch fingerprint, so changing it cannot restart the browser.
+    pub command_timeout: Option<u64>,
     pub no_auto_dialog: bool,
     pub model: Option<String>,
     pub plugins: Vec<PluginConfig>,
@@ -544,6 +548,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
             || config.auto_connect.unwrap_or(false),
         pin_tab: env_var_is_truthy("AGENT_BROWSER_PIN_TAB") || config.pin_tab.unwrap_or(false),
+        force_ownership: false,
         session_name: env::var("AGENT_BROWSER_SESSION_NAME")
             .ok()
             .or(config.session_name),
@@ -554,8 +559,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH")
             .ok()
             .or(config.download_path),
-        content_boundaries: env_var_is_truthy("AGENT_BROWSER_CONTENT_BOUNDARIES")
-            || config.content_boundaries.unwrap_or(false),
+        content_boundaries: env_var_bool("AGENT_BROWSER_CONTENT_BOUNDARIES")
+            .or(config.content_boundaries)
+            .unwrap_or(true),
         max_output: env::var("AGENT_BROWSER_MAX_OUTPUT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -597,8 +603,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
         default_timeout: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok()),
-        no_auto_dialog: env_var_is_truthy("AGENT_BROWSER_NO_AUTO_DIALOG")
-            || config.no_auto_dialog.unwrap_or(false),
+        command_timeout: None,
+        no_auto_dialog: env_var_bool("AGENT_BROWSER_NO_AUTO_DIALOG")
+            .or(config.no_auto_dialog)
+            .unwrap_or(true),
         model: env::var("AI_GATEWAY_MODEL").ok().or(config.model),
         plugins,
         verbose: false,
@@ -884,6 +892,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--force-ownership" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.force_ownership = val;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--session-name" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.session_name = Some(s.clone());
@@ -1005,6 +1020,18 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--timeout" => {
+                if let Some(raw) = args.get(i + 1) {
+                    flags.command_timeout = match parse_idle_timeout(raw) {
+                        Ok(value) => value.parse::<u64>().ok(),
+                        Err(err) => {
+                            eprintln!("{} invalid --timeout: {}", color::warning_indicator(), err);
+                            None
+                        }
+                    };
+                    i += 1;
+                }
+            }
             "--model" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.model = Some(s.clone());
@@ -1025,6 +1052,31 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
+    let task_id = [
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "GROK_SESSION_ID",
+        "CI_JOB_ID",
+    ]
+    .iter()
+    .find_map(|key| env::var(key).ok().filter(|value| !value.trim().is_empty()));
+    if flags.session == "default" {
+        if let Some(task_id) = task_id.as_deref() {
+            let safe = crate::validation::sanitize_session_component(task_id);
+            flags.session = format!("worker-{}", safe.chars().take(48).collect::<String>());
+            if flags.namespace.is_none() {
+                flags.namespace = Some(flags.session.clone());
+            }
+        }
+    }
+
+    // Attaching multiple agents to one Chrome is unsafe without stable tab
+    // binding. An explicit --no-pin-tab keeps the legacy escape hatch.
+    if (flags.cdp.is_some() || flags.auto_connect) && !flags.cli_pin_tab {
+        flags.pin_tab = true;
+        flags.cli_pin_tab = true;
+    }
+
     flags
 }
 
@@ -1048,6 +1100,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--auto-connect",
         "--pin-tab",
         "--no-pin-tab",
+        "--force-ownership",
         "--annotate",
         "--content-boundaries",
         "--confirm-interactive",
@@ -1097,6 +1150,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--screenshot-quality",
         "--screenshot-format",
         "--idle-timeout",
+        "--timeout",
         "--model",
     ];
 
@@ -1915,9 +1969,10 @@ mod tests {
     }
 
     #[test]
-    fn test_no_auto_dialog_default_false() {
+    fn test_dialog_preservation_is_default() {
         let flags = parse_flags(&args("open example.com"));
-        assert!(!flags.no_auto_dialog);
+        assert!(flags.no_auto_dialog);
+        assert!(flags.content_boundaries);
     }
 
     #[test]
@@ -1929,5 +1984,13 @@ mod tests {
         ];
         let clean = clean_args(&input);
         assert_eq!(clean, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn command_timeout_is_not_daemon_default() {
+        let _guard = EnvGuard::new(&["AGENT_BROWSER_DEFAULT_TIMEOUT"]);
+        let flags = parse_flags(&args("--timeout 60s open example.com"));
+        assert_eq!(flags.command_timeout, Some(60_000));
+        assert_eq!(flags.default_timeout, None);
     }
 }

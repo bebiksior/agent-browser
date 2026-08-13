@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
@@ -13,6 +13,20 @@ use tokio_tungstenite::tungstenite::Message;
 use super::types::{CdpCommand, CdpEvent, CdpMessage};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
+type ExecutionContextMap = Arc<RwLock<HashMap<(String, i64), ExecutionContextInfo>>>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionContextInfo {
+    pub id: i64,
+    pub unique_id: Option<String>,
+    pub session_id: String,
+    pub frame_id: String,
+    pub origin: String,
+    pub name: String,
+    pub is_default: bool,
+    pub context_type: Option<String>,
+}
 
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
@@ -41,6 +55,7 @@ pub struct CdpClient {
     pending: PendingMap,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
+    execution_contexts: ExecutionContextMap,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
@@ -114,10 +129,12 @@ impl CdpClient {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
+        let execution_contexts: ExecutionContextMap = Arc::new(RwLock::new(HashMap::new()));
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
+        let execution_contexts_clone = execution_contexts.clone();
 
         // Notify used to stop the keepalive task when the reader loop exits.
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -184,7 +201,12 @@ impl CdpClient {
                         method: method.clone(),
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
+                        received_at_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
                     };
+                    update_execution_contexts(&execution_contexts_clone, &event).await;
                     let _ = event_tx_clone.send(event);
                 }
             }
@@ -223,6 +245,7 @@ impl CdpClient {
             pending,
             event_tx,
             raw_tx,
+            execution_contexts,
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
@@ -293,6 +316,32 @@ impl CdpClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub async fn execution_contexts_for_frame(
+        &self,
+        session_id: &str,
+        frame_id: &str,
+    ) -> Vec<ExecutionContextInfo> {
+        let contexts = self.execution_contexts.read().await;
+        let mut result: Vec<_> = contexts
+            .values()
+            .filter(|context| context.session_id == session_id && context.frame_id == frame_id)
+            .cloned()
+            .collect();
+        result.sort_by_key(|context| context.id);
+        result
+    }
+
+    pub async fn main_world_context(
+        &self,
+        session_id: &str,
+        frame_id: &str,
+    ) -> Option<ExecutionContextInfo> {
+        self.execution_contexts_for_frame(session_id, frame_id)
+            .await
+            .into_iter()
+            .find(|context| context.is_default)
     }
 
     /// Subscribe to all raw incoming CDP messages (responses + events).
@@ -377,6 +426,80 @@ impl CdpClient {
     #[cfg(test)]
     pub(crate) async fn pending_len(&self) -> usize {
         self.pending.lock().await.len()
+    }
+}
+
+async fn update_execution_contexts(contexts: &ExecutionContextMap, event: &CdpEvent) {
+    let session_id = event.session_id.clone().unwrap_or_default();
+    match event.method.as_str() {
+        "Runtime.executionContextCreated" => {
+            let Some(context) = event.params.get("context") else {
+                return;
+            };
+            let Some(id) = context.get("id").and_then(Value::as_i64) else {
+                return;
+            };
+            let Some(aux) = context.get("auxData") else {
+                return;
+            };
+            let Some(frame_id) = aux.get("frameId").and_then(Value::as_str) else {
+                return;
+            };
+            contexts.write().await.insert(
+                (session_id.clone(), id),
+                ExecutionContextInfo {
+                    id,
+                    unique_id: context
+                        .get("uniqueId")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    session_id,
+                    frame_id: frame_id.to_string(),
+                    origin: context
+                        .get("origin")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: context
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    is_default: aux
+                        .get("isDefault")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    context_type: aux
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                },
+            );
+        }
+        "Runtime.executionContextDestroyed" => {
+            if let Some(id) = event
+                .params
+                .get("executionContextId")
+                .and_then(Value::as_i64)
+            {
+                contexts.write().await.remove(&(session_id, id));
+            }
+        }
+        "Runtime.executionContextsCleared" => {
+            contexts
+                .write()
+                .await
+                .retain(|(session, _), _| session != &session_id);
+        }
+        "Target.detachedFromTarget" => {
+            if let Some(detached_session) = event.params.get("sessionId").and_then(Value::as_str) {
+                contexts
+                    .write()
+                    .await
+                    .retain(|(session, _), _| session != detached_session);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -94,6 +94,7 @@ pub struct CdpEvent {
     pub method: String,
     pub params: Value,
     pub session_id: Option<String>,
+    pub received_at_ms: u64,
 }
 
 // ---------------------------------------------------------------------------

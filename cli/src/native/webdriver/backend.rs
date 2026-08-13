@@ -129,6 +129,20 @@ pub const WEBDRIVER_UNSUPPORTED_ACTIONS: &[&str] = &[
     "network",
     "har_start",
     "har_stop",
+    "frames_list",
+    "frames_tree",
+    "frame_inspect",
+    "targets_tree",
+    "postmessage_monitor_start",
+    "postmessage_monitor_stop",
+    "postmessage_messages",
+    "postmessage_send",
+    "context_new",
+    "context_list",
+    "context_close",
+    "evidence_start",
+    "evidence_stop",
+    "evidence_capture",
 ];
 
 #[cfg(test)]

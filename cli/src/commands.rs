@@ -89,6 +89,31 @@ fn normalize_navigation_url(url: &str) -> String {
     }
 }
 
+fn apply_state_selection_args(rest: &[&str], command: &mut Value) -> Result<(), ParseError> {
+    if rest.contains(&"--cookies-only") {
+        command["categories"] = json!("cookies");
+    }
+    if let Some(index) = rest.iter().position(|value| *value == "--categories") {
+        let categories = rest.get(index + 1).ok_or(ParseError::MissingArguments {
+            context: "state --categories".to_string(),
+            usage: "state <save|load|clone|diff> ... --categories <cookies,local-storage,session-storage>",
+        })?;
+        for category in categories.split(',') {
+            if !matches!(
+                category.trim(),
+                "cookies" | "local-storage" | "session-storage"
+            ) {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unsupported state category: {}", category),
+                    usage: "state <save|load|clone|diff> ... --categories <cookies,local-storage,session-storage>",
+                });
+            }
+        }
+        command["categories"] = json!(categories);
+    }
+    Ok(())
+}
+
 pub fn is_top_level_command(value: &str) -> bool {
     matches!(
         value,
@@ -144,6 +169,12 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "tab"
             | "window"
             | "frame"
+            | "frames"
+            | "targets"
+            | "postmessage"
+            | "evidence"
+            | "browser"
+            | "context"
             | "dialog"
             | "trace"
             | "profiler"
@@ -330,12 +361,16 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
     let mut result = parse_command_inner(args, flags)?;
 
+    if flags.force_ownership {
+        result["forceOwnership"] = json!(true);
+    }
+
     // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into any wait-family command that
     // doesn't already carry an explicit timeout. Centralised here so that new
     // wait variants automatically inherit the default without per-variant wiring.
     if let Some(action) = result.get("action").and_then(|a| a.as_str()) {
         if action.starts_with("wait") && result.get("timeout").is_none() {
-            if let Some(t) = flags.default_timeout {
+            if let Some(t) = flags.command_timeout.or(flags.default_timeout) {
                 result["timeout"] = json!(t);
             }
         }
@@ -372,9 +407,51 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             // scripts before the first real navigation (see `batch`).
             // `goto` and `navigate` still require a URL since those verbs
             // imply the navigation itself.
-            let first_url = rest.iter().find(|a| !a.starts_with("--"));
-            let url = match first_url {
-                Some(u) => *u,
+            let mut url_arg = None;
+            let mut wait_until = None;
+            let mut return_on_dialog = true;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--wait" | "--wait-until" => {
+                        let value = rest.get(i + 1).ok_or(ParseError::MissingArguments {
+                            context: format!("{} --wait", cmd),
+                            usage:
+                                "open <url> --wait <commit|load|domcontentloaded|networkidle|none>",
+                        })?;
+                        if !matches!(
+                            *value,
+                            "commit" | "load" | "domcontentloaded" | "networkidle" | "none"
+                        ) {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("Invalid navigation wait state: {}", value),
+                                usage: "open <url> --wait <commit|load|domcontentloaded|networkidle|none>",
+                            });
+                        }
+                        wait_until = Some(*value);
+                        i += 2;
+                    }
+                    "--return-on-dialog" => {
+                        return_on_dialog = true;
+                        i += 1;
+                    }
+                    value if value.starts_with("--") => {
+                        i += 1;
+                    }
+                    value if url_arg.is_none() => {
+                        url_arg = Some(value);
+                        i += 1;
+                    }
+                    value => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unexpected navigation argument: {}", value),
+                            usage: "open <url> [--wait <state>] [--return-on-dialog]",
+                        });
+                    }
+                }
+            }
+            let url = match url_arg {
+                Some(u) => u,
                 None if cmd == "open" => {
                     return Ok(json!({ "id": id, "action": "launch", "headless": !flags.headed }));
                 }
@@ -387,8 +464,16 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             };
             let url = normalize_navigation_url(url);
             let mut nav_cmd = json!({ "id": id, "action": "navigate", "url": url });
-            if flags.provider.is_some() {
+            if let Some(wait) = wait_until {
+                nav_cmd["waitUntil"] = json!(wait);
+            } else if flags.provider.is_some() {
                 nav_cmd["waitUntil"] = json!("none");
+            }
+            if return_on_dialog {
+                nav_cmd["returnOnDialog"] = json!(true);
+            }
+            if let Some(timeout) = flags.command_timeout.or(flags.default_timeout) {
+                nav_cmd["timeout"] = json!(timeout);
             }
             if let Some(ref headers_json) = flags.headers {
                 let headers =
@@ -416,18 +501,22 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === Core Actions ===
         "click" => {
             let new_tab = rest.contains(&"--new-tab");
+            let no_wait = rest.contains(&"--no-wait");
             let sel = rest
                 .iter()
-                .find(|arg| **arg != "--new-tab")
+                .find(|arg| !matches!(**arg, "--new-tab" | "--no-wait"))
                 .ok_or_else(|| ParseError::MissingArguments {
                     context: "click".to_string(),
-                    usage: "click <selector> [--new-tab]",
+                    usage: "click <selector> [--new-tab] [--no-wait]",
                 })?;
+            let mut command = json!({ "id": id, "action": "click", "selector": sel });
             if new_tab {
-                Ok(json!({ "id": id, "action": "click", "selector": sel, "newTab": true }))
-            } else {
-                Ok(json!({ "id": id, "action": "click", "selector": sel }))
+                command["newTab"] = json!(true);
             }
+            if no_wait {
+                command["noWait"] = json!(true);
+            }
+            Ok(command)
         }
         "dblclick" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -899,15 +988,55 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === Eval ===
         "eval" => {
-            // Check for flags: -b/--base64 or --stdin
-            let (is_base64, is_stdin, script_parts): (bool, bool, &[&str]) =
-                if rest.first() == Some(&"-b") || rest.first() == Some(&"--base64") {
-                    (true, false, &rest[1..])
-                } else if rest.first() == Some(&"--stdin") {
-                    (false, true, &rest[1..])
-                } else {
-                    (false, false, rest.as_slice())
-                };
+            let mut is_base64 = false;
+            let mut is_stdin = false;
+            let mut frame = None;
+            let mut world = None;
+            let mut script_parts = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "-b" | "--base64" => {
+                        is_base64 = true;
+                        i += 1;
+                    }
+                    "--stdin" => {
+                        is_stdin = true;
+                        i += 1;
+                    }
+                    "--frame" => {
+                        frame = Some(*rest.get(i + 1).ok_or(ParseError::MissingArguments {
+                            context: "eval --frame".to_string(),
+                            usage: "eval [--frame <frame-id>] [--world <main|isolated>] <script>",
+                        })?);
+                        i += 2;
+                    }
+                    "--world" => {
+                        let value = *rest.get(i + 1).ok_or(ParseError::MissingArguments {
+                            context: "eval --world".to_string(),
+                            usage: "eval --frame <frame-id> --world <main|isolated> <script>",
+                        })?;
+                        if !matches!(value, "main" | "isolated") {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("Invalid evaluation world: {}", value),
+                                usage: "eval --frame <frame-id> --world <main|isolated> <script>",
+                            });
+                        }
+                        world = Some(value);
+                        i += 2;
+                    }
+                    value => {
+                        script_parts.push(value);
+                        i += 1;
+                    }
+                }
+            }
+            if world.is_some() && frame.is_none() {
+                return Err(ParseError::MissingArguments {
+                    context: "eval --world".to_string(),
+                    usage: "eval --frame <frame-id> --world <main|isolated> <script>",
+                });
+            }
 
             let script = if is_stdin {
                 // Read script from stdin
@@ -936,7 +1065,12 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     raw_script
                 }
             };
-            Ok(json!({ "id": id, "action": "evaluate", "script": script }))
+            let mut command = json!({ "id": id, "action": "evaluate", "script": script });
+            if let Some(frame) = frame {
+                command["frameId"] = json!(frame);
+                command["world"] = json!(world.unwrap_or("main"));
+            }
+            Ok(command)
         }
 
         // === Close ===
@@ -1517,7 +1651,11 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     }
                     Ok(cmd)
                 }
-                Some("list") => Ok(json!({ "id": id, "action": "tab_list" })),
+                Some("list") => Ok(json!({
+                    "id": id,
+                    "action": "tab_list",
+                    "owners": rest.contains(&"--owners"),
+                })),
                 Some("close") => {
                     let mut cmd = json!({ "id": id, "action": "tab_close" });
                     if let Some(tab_ref) = rest.get(1) {
@@ -1550,9 +1688,69 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             }
         }
 
+        "context" => match rest.first().copied() {
+            Some("new") => {
+                let mut command = json!({ "id": id, "action": "context_new" });
+                let mut i = 1;
+                while i < rest.len() {
+                    match rest[i] {
+                        "--state" => {
+                            command["statePath"] =
+                                json!(rest.get(i + 1).ok_or(ParseError::MissingArguments {
+                                    context: "context new --state".to_string(),
+                                    usage: "context new [--state <path>] [--cookies-only] [url]",
+                                })?);
+                            i += 2;
+                        }
+                        "--cookies-only" => {
+                            command["cookiesOnly"] = json!(true);
+                            i += 1;
+                        }
+                        value if !value.starts_with("--") && command.get("url").is_none() => {
+                            command["url"] = json!(normalize_navigation_url(value));
+                            i += 1;
+                        }
+                        value => {
+                            return Err(ParseError::UnknownSubcommand {
+                                subcommand: value.to_string(),
+                                valid_options: &["--state", "--cookies-only", "<url>"],
+                            })
+                        }
+                    }
+                }
+                Ok(command)
+            }
+            Some("list") => Ok(json!({ "id": id, "action": "context_list" })),
+            Some("close") => Ok(json!({
+                "id": id,
+                "action": "context_close",
+                "contextId": rest.get(1).ok_or(ParseError::MissingArguments {
+                    context: "context close".to_string(),
+                    usage: "context close <browser-context-id>",
+                })?,
+            })),
+            Some(value) => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["new", "list", "close"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "context".to_string(),
+                usage: "context <new|list|close>",
+            }),
+        },
+
         // === Frame ===
         "frame" => {
-            if rest.first().copied() == Some("main") {
+            if rest.first().copied() == Some("inspect") {
+                Ok(json!({
+                    "id": id,
+                    "action": "frame_inspect",
+                    "frameId": rest.get(1).ok_or(ParseError::MissingArguments {
+                        context: "frame inspect".to_string(),
+                        usage: "frame inspect <frame-id>",
+                    })?,
+                }))
+            } else if rest.first().copied() == Some("main") {
                 Ok(json!({ "id": id, "action": "mainframe" }))
             } else {
                 let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -1563,9 +1761,26 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             }
         }
 
+        "frames" => match rest.first().copied().unwrap_or("list") {
+            "list" => Ok(json!({ "id": id, "action": "frames_list" })),
+            "tree" => Ok(json!({ "id": id, "action": "frames_tree" })),
+            value => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["list", "tree"],
+            }),
+        },
+
+        "targets" => match rest.first().copied().unwrap_or("tree") {
+            "tree" | "list" => Ok(json!({ "id": id, "action": "targets_tree" })),
+            value => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["tree", "list"],
+            }),
+        },
+
         // === Dialog ===
         "dialog" => {
-            const VALID: &[&str] = &["accept", "dismiss", "status"];
+            const VALID: &[&str] = &["accept", "dismiss", "status", "wait", "history"];
             match rest.first().copied() {
                 Some("accept") => {
                     let mut cmd = json!({ "id": id, "action": "dialog", "response": "accept" });
@@ -1582,16 +1797,179 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     Ok(cmd)
                 }
                 Some("status") => Ok(json!({ "id": id, "action": "dialog", "response": "status" })),
+                Some("wait") => {
+                    let mut command = json!({ "id": id, "action": "dialog", "response": "wait" });
+                    if let Some(index) = rest.iter().position(|arg| *arg == "--timeout") {
+                        let value = rest.get(index + 1).ok_or(ParseError::MissingArguments {
+                            context: "dialog wait --timeout".to_string(),
+                            usage: "dialog wait [--timeout <ms>]",
+                        })?;
+                        command["timeout"] =
+                            json!(value.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                                message: "Dialog wait timeout must be milliseconds".to_string(),
+                                usage: "dialog wait [--timeout <ms>]",
+                            })?);
+                    } else if let Some(timeout) = flags.command_timeout.or(flags.default_timeout) {
+                        command["timeout"] = json!(timeout);
+                    }
+                    Ok(command)
+                }
+                Some("history") => Ok(json!({
+                    "id": id,
+                    "action": "dialog",
+                    "response": "history",
+                    "clear": rest.contains(&"--clear"),
+                })),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
                     valid_options: VALID,
                 }),
                 None => Err(ParseError::MissingArguments {
                     context: "dialog".to_string(),
-                    usage: "dialog <accept|dismiss|status> [text]",
+                    usage: "dialog <accept|dismiss|status|wait|history> [options]",
                 }),
             }
         }
+
+        "postmessage" => match rest.first().copied() {
+            Some("monitor") => match rest.get(1).copied() {
+                Some("start") => Ok(json!({ "id": id, "action": "postmessage_monitor_start" })),
+                Some("stop") => Ok(json!({ "id": id, "action": "postmessage_monitor_stop" })),
+                Some(value) => Err(ParseError::UnknownSubcommand {
+                    subcommand: value.to_string(),
+                    valid_options: &["start", "stop"],
+                }),
+                None => Err(ParseError::MissingArguments {
+                    context: "postmessage monitor".to_string(),
+                    usage: "postmessage monitor <start|stop>",
+                }),
+            },
+            Some("messages") => {
+                let mut command = json!({
+                    "id": id,
+                    "action": "postmessage_messages",
+                    "clear": rest.contains(&"--clear"),
+                });
+                for (flag, key) in [("--origin", "origin"), ("--frame", "frameId")] {
+                    if let Some(index) = rest.iter().position(|value| *value == flag) {
+                        command[key] = json!(rest.get(index + 1).ok_or(ParseError::MissingArguments {
+                            context: format!("postmessage messages {}", flag),
+                            usage: "postmessage messages [--clear] [--origin <origin>] [--frame <frame-id>]",
+                        })?);
+                    }
+                }
+                Ok(command)
+            }
+            Some("send") => {
+                let mut command = json!({ "id": id, "action": "postmessage_send" });
+                let options = [
+                    ("--from-frame", "fromFrame"),
+                    ("--to-frame", "toFrame"),
+                    ("--target", "target"),
+                    ("--target-origin", "targetOrigin"),
+                    ("--data", "data"),
+                    ("--data-file", "dataFile"),
+                ];
+                for (flag, key) in options {
+                    if let Some(index) = rest.iter().position(|value| *value == flag) {
+                        command[key] = json!(rest.get(index + 1).ok_or(ParseError::MissingArguments {
+                            context: format!("postmessage send {}", flag),
+                            usage: "postmessage send --from-frame <id> [--to-frame <id>|--target <parent|top|opener>] --target-origin <origin> (--data <json>|--data-file <path>)",
+                        })?);
+                    }
+                }
+                if command.get("fromFrame").is_none()
+                    || command.get("targetOrigin").is_none()
+                    || (command.get("data").is_none() && command.get("dataFile").is_none())
+                {
+                    return Err(ParseError::MissingArguments {
+                        context: "postmessage send".to_string(),
+                        usage: "postmessage send --from-frame <id> [--to-frame <id>|--target <parent|top|opener>] --target-origin <origin> (--data <json>|--data-file <path>)",
+                    });
+                }
+                if command.get("toFrame").is_some() && command.get("target").is_some() {
+                    return Err(ParseError::InvalidValue {
+                        message: "--to-frame and --target are mutually exclusive".to_string(),
+                        usage: "postmessage send --from-frame <id> [--to-frame <id>|--target <parent|top|opener>] --target-origin <origin> (--data <json>|--data-file <path>)",
+                    });
+                }
+                if command.get("data").is_some() && command.get("dataFile").is_some() {
+                    return Err(ParseError::InvalidValue {
+                        message: "--data and --data-file are mutually exclusive".to_string(),
+                        usage: "postmessage send --from-frame <id> [--to-frame <id>|--target <parent|top|opener>] --target-origin <origin> (--data <json>|--data-file <path>)",
+                    });
+                }
+                Ok(command)
+            }
+            Some(value) => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["monitor", "messages", "send"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "postmessage".to_string(),
+                usage: "postmessage <monitor|messages|send>",
+            }),
+        },
+
+        "evidence" => match rest.first().copied() {
+            Some("start") => Ok(json!({
+                "id": id,
+                "action": "evidence_start",
+                "path": rest.get(1).ok_or(ParseError::MissingArguments {
+                    context: "evidence start".to_string(),
+                    usage: "evidence start <directory> [--include-private]",
+                })?,
+                "includePrivate": rest.contains(&"--include-private"),
+            })),
+            Some("stop") => Ok(json!({ "id": id, "action": "evidence_stop" })),
+            Some("status") => Ok(json!({ "id": id, "action": "evidence_status" })),
+            Some("capture") => Ok(json!({ "id": id, "action": "evidence_capture" })),
+            Some(value) => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["start", "stop", "status", "capture"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "evidence".to_string(),
+                usage: "evidence <start|stop|status|capture>",
+            }),
+        },
+
+        "browser" => match rest.first().copied() {
+            Some("owners") => Ok(json!({ "id": id, "action": "browser_owners" })),
+            Some("lease") => match rest.get(1).copied() {
+                Some("acquire") => Ok(json!({
+                    "id": id,
+                    "action": "browser_lease_acquire",
+                    "profile": rest.get(2).copied().or(flags.profile.as_deref()).unwrap_or("default"),
+                })),
+                Some("status") => Ok(json!({
+                    "id": id,
+                    "action": "browser_lease_status",
+                    "profile": rest.get(2).copied().or(flags.profile.as_deref()).unwrap_or("default"),
+                })),
+                Some("release") => Ok(json!({
+                    "id": id,
+                    "action": "browser_lease_release",
+                    "profile": rest.get(2).copied().or(flags.profile.as_deref()).unwrap_or("default"),
+                })),
+                Some(value) => Err(ParseError::UnknownSubcommand {
+                    subcommand: value.to_string(),
+                    valid_options: &["acquire", "status", "release"],
+                }),
+                None => Err(ParseError::MissingArguments {
+                    context: "browser lease".to_string(),
+                    usage: "browser lease <acquire|status|release> [profile]",
+                }),
+            },
+            Some(value) => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["owners", "lease"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "browser".to_string(),
+                usage: "browser <owners|lease>",
+            }),
+        },
 
         // === Debug ===
         "trace" => {
@@ -1745,21 +2123,64 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === State ===
         "state" => {
-            const VALID: &[&str] = &["save", "load", "list", "clear", "show", "clean", "rename"];
+            const VALID: &[&str] = &[
+                "save", "load", "clone", "diff", "list", "clear", "show", "clean", "rename",
+            ];
             match rest.first().copied() {
                 Some("save") => {
                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "state save".to_string(),
                         usage: "state save <path>",
                     })?;
-                    Ok(json!({ "id": id, "action": "state_save", "path": path }))
+                    let mut command = json!({ "id": id, "action": "state_save", "path": path });
+                    apply_state_selection_args(&rest[2..], &mut command)?;
+                    Ok(command)
                 }
                 Some("load") => {
                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "state load".to_string(),
                         usage: "state load <path>",
                     })?;
-                    Ok(json!({ "id": id, "action": "state_load", "path": path }))
+                    let mut command = json!({ "id": id, "action": "state_load", "path": path });
+                    apply_state_selection_args(&rest[2..], &mut command)?;
+                    Ok(command)
+                }
+                Some("clone") => {
+                    let source = rest.get(1).ok_or(ParseError::MissingArguments {
+                        context: "state clone".to_string(),
+                        usage: "state clone <source> <destination> [--cookies-only|--categories <list>]",
+                    })?;
+                    let destination = rest.get(2).ok_or(ParseError::MissingArguments {
+                        context: "state clone".to_string(),
+                        usage: "state clone <source> <destination> [--cookies-only|--categories <list>]",
+                    })?;
+                    let mut command = json!({
+                        "id": id,
+                        "action": "state_clone",
+                        "source": source,
+                        "destination": destination,
+                    });
+                    apply_state_selection_args(&rest[3..], &mut command)?;
+                    Ok(command)
+                }
+                Some("diff") => {
+                    let left = rest.get(1).ok_or(ParseError::MissingArguments {
+                        context: "state diff".to_string(),
+                        usage: "state diff <left> <right> [--show-values] [--categories <list>]",
+                    })?;
+                    let right = rest.get(2).ok_or(ParseError::MissingArguments {
+                        context: "state diff".to_string(),
+                        usage: "state diff <left> <right> [--show-values] [--categories <list>]",
+                    })?;
+                    let mut command = json!({
+                        "id": id,
+                        "action": "state_diff",
+                        "left": left,
+                        "right": right,
+                        "showValues": rest.contains(&"--show-values"),
+                    });
+                    apply_state_selection_args(&rest[3..], &mut command)?;
+                    Ok(command)
                 }
                 Some("list") => Ok(json!({ "id": id, "action": "state_list" })),
                 Some("clear") => {
@@ -2978,8 +3399,93 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 .position(|&s| s == "--resource-type" || s == "--resource-types");
             let resource_type = rt_idx.and_then(|i| rest.get(i + 1).copied());
             let mut cmd = json!({ "id": id, "action": "route", "url": url, "abort": abort });
+            if let Some(index) = rest.iter().position(|&value| value == "--stage") {
+                let stage = rest.get(index + 1).ok_or(ParseError::MissingArguments {
+                    context: "network route --stage".to_string(),
+                    usage: "network route <pattern> --stage <request|response>",
+                })?;
+                if !matches!(*stage, "request" | "response") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("Invalid interception stage: {}", stage),
+                        usage: "network route <pattern> --stage <request|response>",
+                    });
+                }
+                cmd["stage"] = json!(stage);
+            }
             if let Some(body) = body {
                 cmd["response"] = json!({ "body": body });
+            }
+            let status = rest
+                .iter()
+                .position(|&value| value == "--status")
+                .and_then(|index| rest.get(index + 1))
+                .map(|value| value.parse::<u16>())
+                .transpose()
+                .map_err(|_| ParseError::InvalidValue {
+                    message: "Route status must be an HTTP status code".to_string(),
+                    usage: "network route <pattern> [--status <code>]",
+                })?;
+            let response_headers = rest
+                .iter()
+                .position(|&value| value == "--response-headers")
+                .and_then(|index| rest.get(index + 1))
+                .map(|value| serde_json::from_str::<Value>(value))
+                .transpose()
+                .map_err(|error| ParseError::InvalidValue {
+                    message: format!("Invalid response header JSON: {}", error),
+                    usage: "network route <pattern> --response-headers '{\"Name\":\"Value\"}'",
+                })?;
+            if status.is_some() || response_headers.is_some() {
+                if cmd.get("response").is_none() {
+                    cmd["response"] = json!({});
+                }
+                if let Some(status) = status {
+                    cmd["response"]["status"] = json!(status);
+                }
+                if let Some(headers) = response_headers {
+                    cmd["response"]["headers"] = headers;
+                }
+            }
+            let request_url = rest
+                .iter()
+                .position(|&value| value == "--rewrite-url")
+                .and_then(|index| rest.get(index + 1));
+            let request_method = rest
+                .iter()
+                .position(|&value| value == "--rewrite-method")
+                .and_then(|index| rest.get(index + 1));
+            let request_body = rest
+                .iter()
+                .position(|&value| value == "--rewrite-body")
+                .and_then(|index| rest.get(index + 1));
+            let request_headers = rest
+                .iter()
+                .position(|&value| value == "--request-headers")
+                .and_then(|index| rest.get(index + 1))
+                .map(|value| serde_json::from_str::<Value>(value))
+                .transpose()
+                .map_err(|error| ParseError::InvalidValue {
+                    message: format!("Invalid request header JSON: {}", error),
+                    usage: "network route <pattern> --request-headers '{\"Name\":\"Value\"}'",
+                })?;
+            if request_url.is_some()
+                || request_method.is_some()
+                || request_body.is_some()
+                || request_headers.is_some()
+            {
+                cmd["request"] = json!({});
+                if let Some(value) = request_url {
+                    cmd["request"]["url"] = json!(value);
+                }
+                if let Some(value) = request_method {
+                    cmd["request"]["method"] = json!(value);
+                }
+                if let Some(value) = request_body {
+                    cmd["request"]["postData"] = json!(value);
+                }
+                if let Some(value) = request_headers {
+                    cmd["request"]["headers"] = value;
+                }
             }
             if let Some(rt) = resource_type {
                 cmd["resourceType"] = json!(rt);
@@ -3023,7 +3529,14 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "network request".to_string(),
                 usage: "network request <requestId>",
             })?;
-            Ok(json!({ "id": id, "action": "request_detail", "requestId": request_id }))
+            let mut cmd = json!({ "id": id, "action": "request_detail", "requestId": request_id });
+            if let Some(index) = rest.iter().position(|value| *value == "--raw-out") {
+                cmd["rawOut"] = json!(rest.get(index + 1).ok_or(ParseError::MissingArguments {
+                    context: "network request --raw-out".to_string(),
+                    usage: "network request <requestId> --raw-out <path>",
+                },)?);
+            }
+            Ok(cmd)
         }
         Some("har") => {
             const HAR_VALID: &[&str] = &["start", "stop"];
@@ -3189,6 +3702,7 @@ mod tests {
             device: None,
             auto_connect: false,
             pin_tab: false,
+            force_ownership: false,
             session_name: None,
             restore: None,
             restore_save: None,
@@ -3230,6 +3744,7 @@ mod tests {
             screenshot_format: None,
             idle_timeout: None,
             default_timeout: None,
+            command_timeout: None,
             no_auto_dialog: false,
             model: None,
             plugins: Vec::new(),
@@ -4033,6 +4548,12 @@ mod tests {
         let cmd = parse_command(&args("click #button"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "click");
         assert_eq!(cmd["selector"], "#button");
+
+        let cmd =
+            parse_command(&args("click --no-wait #link --new-tab"), &default_flags()).unwrap();
+        assert_eq!(cmd["selector"], "#link");
+        assert_eq!(cmd["newTab"], true);
+        assert_eq!(cmd["noWait"], true);
     }
 
     #[test]
@@ -5883,5 +6404,78 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ParseError::MissingArguments { .. }));
+    }
+
+    #[test]
+    fn navigation_returns_on_dialog_and_waits_for_commit_by_default() {
+        let mut flags = default_flags();
+        flags.command_timeout = Some(60_000);
+        let command =
+            parse_command(&args("open https://example.test --wait commit"), &flags).unwrap();
+        assert_eq!(command["waitUntil"], "commit");
+        assert_eq!(command["returnOnDialog"], true);
+        assert_eq!(command["timeout"], 60_000);
+    }
+
+    #[test]
+    fn navigation_rejects_unknown_wait_state() {
+        let error = parse_command(
+            &args("open https://example.test --wait almost"),
+            &default_flags(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ParseError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn parses_response_and_request_stage_interception() {
+        let response = parse_command(
+            &args(
+                "network route *api* --stage response --body patched --status 202 --response-headers {\"X-Test\":\"yes\"}",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(response["stage"], "response");
+        assert_eq!(response["response"]["status"], 202);
+        assert_eq!(response["response"]["headers"]["X-Test"], "yes");
+
+        let request = parse_command(
+            &args(
+                "network route *api* --rewrite-url https://example.test/new --rewrite-method POST --rewrite-body payload",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(request["request"]["method"], "POST");
+        assert_eq!(request["request"]["postData"], "payload");
+    }
+
+    #[test]
+    fn parses_frame_postmessage_context_and_evidence_commands() {
+        assert_eq!(
+            parse_command(&args("frames tree"), &default_flags()).unwrap()["action"],
+            "frames_tree"
+        );
+        assert_eq!(
+            parse_command(&args("postmessage monitor start"), &default_flags()).unwrap()["action"],
+            "postmessage_monitor_start"
+        );
+        assert_eq!(
+            parse_command(
+                &args("context new --state auth.json --cookies-only"),
+                &default_flags()
+            )
+            .unwrap()["cookiesOnly"],
+            true
+        );
+        assert_eq!(
+            parse_command(
+                &args("evidence start proof --include-private"),
+                &default_flags()
+            )
+            .unwrap()["includePrivate"],
+            true
+        );
     }
 }

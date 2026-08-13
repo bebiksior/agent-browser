@@ -384,6 +384,80 @@ fn format_a11y_target(target: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn format_frame_graph_text(data: &serde_json::Value, tree: bool) -> Option<String> {
+    let frames = data.get("frames")?.as_array()?;
+    let mut lines = Vec::new();
+    for frame in frames {
+        let id = frame.get("frameId").and_then(|value| value.as_str())?;
+        let origin = frame
+            .get("securityOrigin")
+            .and_then(|value| value.as_str())
+            .unwrap_or("opaque");
+        let url = frame
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let depth = if tree {
+            let mut depth = 0;
+            let mut parent = frame.get("parentId").and_then(|value| value.as_str());
+            while let Some(parent_id) = parent {
+                depth += 1;
+                parent = frames
+                    .iter()
+                    .find(|candidate| {
+                        candidate.get("frameId").and_then(|value| value.as_str()) == Some(parent_id)
+                    })
+                    .and_then(|candidate| candidate.get("parentId"))
+                    .and_then(|value| value.as_str());
+                if depth > frames.len() {
+                    break;
+                }
+            }
+            depth
+        } else {
+            0
+        };
+        let oopif = frame
+            .get("oopifSessionId")
+            .and_then(|value| value.as_str())
+            .map(|_| " oopif")
+            .unwrap_or("");
+        lines.push(format!(
+            "{}{} {}{}\n{}  {}",
+            "  ".repeat(depth),
+            id,
+            origin,
+            oopif,
+            "  ".repeat(depth),
+            url
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn format_target_graph_text(data: &serde_json::Value) -> Option<String> {
+    let targets = data.get("targets")?.as_array()?;
+    let mut lines = Vec::new();
+    for target in targets {
+        let id = target.get("targetId").and_then(|value| value.as_str())?;
+        let kind = target
+            .get("targetType")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let url = target
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let relationship = target
+            .get("openerId")
+            .and_then(|value| value.as_str())
+            .map(|opener| format!(" opener={}", opener))
+            .unwrap_or_default();
+        lines.push(format!("{} {}{}\n  {}", id, kind, relationship, url));
+    }
+    Some(lines.join("\n"))
+}
+
 pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &OutputOptions) {
     if opts.json {
         if opts.content_boundaries {
@@ -411,6 +485,39 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
     }
 
     if !resp.success {
+        if resp.code.as_deref() == Some("navigation_timeout") {
+            eprintln!("{} Navigation timed out", color::error_indicator());
+            if let Some(navigation) = resp.data.as_ref().and_then(|data| data.get("navigation")) {
+                let wait = navigation
+                    .get("wait")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("load");
+                let committed = navigation
+                    .get("committed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let usable = navigation
+                    .get("browserUsable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                eprintln!(
+                    "  wait: {}  committed: {}  browser usable: {}",
+                    wait, committed, usable
+                );
+                if let Some(url) = resp
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("url"))
+                    .and_then(|v| v.as_str())
+                {
+                    eprintln!("  url: {}", url);
+                }
+            }
+            if let Some(ref warning) = resp.warning {
+                eprintln!("{} {}", color::warning_indicator(), warning);
+            }
+            return;
+        }
         eprintln!(
             "{} {}",
             color::error_indicator(),
@@ -453,6 +560,27 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                 print_warning(resp);
                 return;
             }
+            if let Some(events) = data.get("events").and_then(|v| v.as_array()) {
+                if events.is_empty() {
+                    println!("{} No dialog events recorded", color::success_indicator());
+                } else {
+                    for event in events {
+                        let id = event.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let kind = event
+                            .get("dialogType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        let state = if event.get("open").and_then(|v| v.as_bool()) == Some(true) {
+                            "open"
+                        } else {
+                            "closed"
+                        };
+                        println!("#{} {} {}: {}", id, kind, state, message);
+                    }
+                }
+                return;
+            }
         }
         if let Some(output) = format_stream_status_text(action, data) {
             println!("{}", output);
@@ -468,6 +596,33 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         }
         if action == Some("storage_get") {
             if let Some(output) = format_storage_text(data) {
+                println!("{}", output);
+                return;
+            }
+        }
+        if matches!(action, Some("frames_list" | "frames_tree")) {
+            if let Some(output) = format_frame_graph_text(data, action == Some("frames_tree")) {
+                println!("{}", output);
+                return;
+            }
+        }
+        if action == Some("frame_inspect") {
+            if let Some(frame) = data.get("frame") {
+                if let Some(output) =
+                    format_frame_graph_text(&serde_json::json!({ "frames": [frame] }), false)
+                {
+                    println!("{}", output);
+                    if let Some(contexts) =
+                        frame.get("executionContexts").and_then(|v| v.as_array())
+                    {
+                        println!("  execution contexts: {}", contexts.len());
+                    }
+                    return;
+                }
+            }
+        }
+        if action == Some("targets_tree") {
+            if let Some(output) = format_target_graph_text(data) {
                 println!("{}", output);
                 return;
             }
@@ -497,6 +652,21 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                     .or_else(|| data.get("url").and_then(|v| v.as_str()));
                 print_with_boundaries(content, origin, opts);
             }
+            return;
+        }
+        if action == Some("navigate")
+            && data.pointer("/navigation/status").and_then(|v| v.as_str()) == Some("dialog")
+        {
+            let message = data
+                .pointer("/dialog/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            println!(
+                "{} Navigation returned on JavaScript dialog: {}",
+                color::warning_indicator(),
+                message
+            );
+            println!("  Resolve it with `dialog accept` or `dialog dismiss`");
             return;
         }
         // Navigation response
@@ -1398,6 +1568,11 @@ is automatically prepended.
 
 The `goto` and `navigate` aliases still require a URL.
 
+Navigation Options:
+  --wait <state>       commit, load, domcontentloaded, networkidle, or none
+  --return-on-dialog   Return immediately if navigation opens a JavaScript dialog
+  --timeout <ms>       Return structured partial navigation state on timeout
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1521,7 +1696,7 @@ Examples:
             r##"
 agent-browser click - Click an element
 
-Usage: agent-browser click <selector> [--new-tab]
+Usage: agent-browser click <selector> [--new-tab] [--no-wait]
 
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
@@ -1532,6 +1707,7 @@ covering element instead of dispatching a click to the wrong target.
 Options:
   --new-tab            Open link in a new tab instead of navigating current tab
                        (only works on elements with href attribute)
+  --no-wait            Return after input dispatch without waiting for new-tab lifecycle
 
 Global Options:
   --json               Output as JSON
@@ -2489,13 +2665,14 @@ Examples:
             r##"
 agent-browser frame - Switch frame context
 
-Usage: agent-browser frame <selector|main>
+Usage: agent-browser frame <selector|main|inspect>
 
 Switch to an iframe or back to the main frame.
 
 Arguments:
   <selector>           CSS selector for iframe
   main                 Switch back to main frame
+  inspect <frame-id>   Inspect one frame by its stable CDP frame ID
 
 Global Options:
   --json               Output as JSON
@@ -2505,6 +2682,85 @@ Examples:
   agent-browser frame "#embed-iframe"
   agent-browser frame "iframe[name='content']"
   agent-browser frame main
+  agent-browser frames tree
+  agent-browser eval --frame <frame-id> --world isolated 'location.href'
+"##
+        }
+
+        "frames" => {
+            r##"
+agent-browser frames - Inspect the current frame graph
+
+Usage: agent-browser frames [list|tree]
+
+Returns stable frame IDs, parent/child relationships, origins, URLs, OOPIF
+sessions, and iframe sandbox or credentialless metadata.
+"##
+        }
+
+        "targets" => {
+            r##"
+agent-browser targets - Inspect the browser target graph
+
+Usage: agent-browser targets [tree|list]
+
+Returns pages, workers, popups, opener relationships, and browser context IDs.
+"##
+        }
+
+        "context" => {
+            r##"
+agent-browser context - Manage isolated browser contexts
+
+Usage:
+  agent-browser context new [--state <path>] [--cookies-only] [url]
+  agent-browser context list
+  agent-browser context close <browser-context-id>
+
+Create clean contexts and optionally seed them from a full or cookies-only state file.
+"##
+        }
+
+        "postmessage" => {
+            r##"
+agent-browser postmessage - Inspect and exercise cross-window messaging
+
+Usage:
+  agent-browser postmessage monitor <start|stop>
+  agent-browser postmessage messages [--origin <origin>] [--frame <id>] [--clear]
+  agent-browser postmessage send --from-frame <id> [--to-frame <id>|--target <self|parent|top|opener>] --target-origin <origin> --data <json>
+
+The monitor runs in an isolated world and records receiver frame, sender
+relationship, origin, payload, and timestamp without modifying page handlers.
+"##
+        }
+
+        "evidence" => {
+            r##"
+agent-browser evidence - Capture a reproducible evidence bundle
+
+Usage:
+  agent-browser evidence start <directory>
+  agent-browser evidence capture
+  agent-browser evidence status
+  agent-browser evidence stop
+
+Bundles contain action logs, dialogs, console/errors, correlated network
+events, frame metadata, screenshots, redacted copies, hashes, and a manifest.
+Private files are owner-only. Screenshots remain private unless separately redacted.
+"##
+        }
+
+        "browser" => {
+            r##"
+agent-browser browser - Inspect ownership and coordinate shared profiles
+
+Usage:
+  agent-browser browser owners
+  agent-browser browser lease <acquire|status|release> [profile]
+
+Ownership refuses silent cross-worker target reuse. Profile leases are atomic,
+expire safely, and are scoped per session for temporary profiles.
 "##
         }
 
@@ -2585,7 +2841,7 @@ Examples:
             r##"
 agent-browser dialog - Handle browser dialogs
 
-Usage: agent-browser dialog <accept|dismiss|status> [text]
+Usage: agent-browser dialog <accept|dismiss|status|wait|history> [text]
 
 Respond to or check for browser dialogs (alert, confirm, prompt).
 
@@ -2593,6 +2849,8 @@ Operations:
   accept [text]        Accept dialog, optionally with prompt text
   dismiss              Dismiss/cancel dialog
   status               Check if a dialog is currently open
+  wait [--timeout ms]  Wait for the active tab to open a dialog
+  history [--clear]    Show persistent dialog open/close history
 
 Global Options:
   --json               Output as JSON
@@ -2603,6 +2861,8 @@ Examples:
   agent-browser dialog accept "my input"
   agent-browser dialog dismiss
   agent-browser dialog status
+  agent-browser dialog wait --timeout 5000
+  agent-browser dialog history
 "##
         }
 
@@ -2809,11 +3069,18 @@ Save, restore, list, and manage browser state (cookies, localStorage, sessionSto
 Operations:
   save <path>                        Save current state to file
   load <path>                        Load state from file
+  clone <source> <destination>       Create a filtered, non-overwriting copy
+  diff <left> <right>                Compare state with values redacted by default
   list                               List saved state files
   show <filename>                    Show state summary
   rename <old-name> <new-name>       Rename state file
   clear [session-name] [--all]       Clear saved states
   clean --older-than <days>          Delete expired state files
+
+Selection Options:
+  --cookies-only                     Operate only on cookies
+  --categories <csv>                 cookies,local-storage,session-storage
+  --show-values                      Show values in state diff output
 
 Automatic State Persistence:
   Use --restore to auto-save/restore state across restarts:
@@ -2831,6 +3098,8 @@ Global Options:
 Examples:
   agent-browser state save ./auth-state.json
   agent-browser state load ./auth-state.json
+  agent-browser state clone ./auth.json ./cookies.json --cookies-only
+  agent-browser state diff ./before.json ./after.json
   agent-browser state list
   agent-browser state show myapp-default.json
   agent-browser state rename old-name new-name
@@ -3536,6 +3805,12 @@ Core Commands:
   pdf <path>                 Save as PDF
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
+  frames [tree|list]         Inspect frame IDs, origins, and iframe policy
+  targets [tree|list]        Inspect pages, popups, workers, and contexts
+  postmessage <action>       Monitor or send cross-window messages
+  evidence <action>          Capture a redacted, hashed evidence bundle
+  context <action>           Create and manage isolated browser contexts
+  browser <action>           Inspect target owners or acquire profile leases
   connect <port|url>         Connect to browser via CDP
   close [--all]              Close browser (--all closes every session)
 
@@ -3543,6 +3818,7 @@ Navigation:
   back                       Go back
   forward                    Go forward
   reload                     Reload page
+  open <url> --wait commit --return-on-dialog
 
 Get Info:  agent-browser get <what> [selector]
   text, html, value, attr <name>, title, url, count, box, styles, cdp-url
@@ -3583,6 +3859,10 @@ Diff:
 Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
+
+Security Workflow:
+  frames tree                Inspect stable frame IDs and trust boundaries
+  targets tree               Inspect page, popup, opener, and context relationships
   profiler start|stop [path] Record Chrome DevTools profile
   record start <path> [url]  Start video recording (WebM)
   record stop                Stop and save video
@@ -3746,6 +4026,7 @@ Options:
   --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
+  --timeout <ms>             Default command and navigation timeout in milliseconds
   --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
@@ -3972,8 +4253,8 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
-        format_with_boundaries, OutputOptions,
+        boundary_origin, format_a11y_text, format_frame_graph_text, format_storage_text,
+        format_target_graph_text, format_vitals_text, format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
@@ -4223,5 +4504,32 @@ hydration: -  phases: 0  hydratedComponents: 0"
             boundary_origin(&json!({ "url": "https://example.com/source" })),
             Some("https://example.com/source")
         );
+    }
+
+    #[test]
+    fn frame_graph_text_shows_ids_origins_and_hierarchy() {
+        let data = json!({
+            "frames": [
+                { "frameId": "top", "parentId": null, "securityOrigin": "https://top.test", "url": "https://top.test/" },
+                { "frameId": "child", "parentId": "top", "securityOrigin": "https://child.test", "url": "https://child.test/", "oopifSessionId": "session" }
+            ]
+        });
+        let rendered = format_frame_graph_text(&data, true).unwrap();
+        assert!(rendered.contains("top https://top.test"));
+        assert!(rendered.contains("  child https://child.test oopif"));
+    }
+
+    #[test]
+    fn target_graph_text_shows_opener_relationship() {
+        let data = json!({
+            "targets": [{
+                "targetId": "popup",
+                "targetType": "page",
+                "openerId": "main",
+                "url": "https://popup.test/"
+            }]
+        });
+        let rendered = format_target_graph_text(&data).unwrap();
+        assert!(rendered.contains("popup page opener=main"));
     }
 }
