@@ -15,7 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
-use super::cdp::chrome::LaunchOptions;
+use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
@@ -372,6 +372,7 @@ fn launch_hash(
     opts.proxy_username.hash(&mut h);
     opts.proxy_password.hash(&mut h);
     opts.user_agent.hash(&mut h);
+    opts.ca_cert_digest.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
     opts.webgpu.hash(&mut h);
@@ -412,6 +413,84 @@ fn launch_connection_is_external(
     provider_name: Option<&str>,
 ) -> bool {
     launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
+}
+
+fn validate_ca_cert_launch_mode(
+    options: &LaunchOptions,
+    engine: Option<&str>,
+    external_launch: bool,
+) -> Result<(), String> {
+    if options.ca_cert.is_none() {
+        return Ok(());
+    }
+    if external_launch {
+        return Err(
+            "CA trust is active for this session and requires a locally launched Chromium browser on Linux. Pass --no-ca-cert to clear it before using CDP, auto-connect, or a provider."
+                .to_string(),
+        );
+    }
+    if engine.is_some_and(|value| !value.eq_ignore_ascii_case("chrome")) {
+        return Err("--ca-cert is supported only with the Chrome engine on Linux".to_string());
+    }
+    if options.ignore_https_errors {
+        return Err("--ca-cert cannot be combined with --ignore-https-errors".to_string());
+    }
+    super::browser::validate_launch_options(
+        options.extensions.as_deref(),
+        false,
+        options.profile.as_deref(),
+        options.storage_state.as_deref(),
+        options.allow_file_access,
+        options.executable_path.as_deref(),
+        options.ca_cert.as_deref(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveCaCert {
+    path: String,
+    bundle: crate::ca_bundle::CaBundle,
+}
+
+fn resolve_effective_ca_cert(
+    cmd: &Value,
+    state: &DaemonState,
+) -> Result<Option<EffectiveCaCert>, String> {
+    let requested_path = cmd.get("caCert").and_then(Value::as_str);
+    let clear = cmd
+        .get("clearCaCert")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if requested_path.is_some() && clear {
+        return Err("Cannot use --ca-cert with --no-ca-cert".to_string());
+    }
+    if clear {
+        return Ok(None);
+    }
+    let Some(path) = requested_path else {
+        return Ok(state.effective_ca_cert.clone());
+    };
+    let bundle = crate::ca_bundle::load(path)?;
+    if state
+        .effective_ca_cert
+        .as_ref()
+        .is_some_and(|current| current.bundle.digest() == bundle.digest())
+    {
+        return Ok(state.effective_ca_cert.clone());
+    }
+    Ok(Some(EffectiveCaCert {
+        path: path.to_string(),
+        bundle,
+    }))
+}
+
+fn apply_effective_ca_cert(
+    options: &mut LaunchOptions,
+    effective_ca_cert: &Option<EffectiveCaCert>,
+) {
+    options.ca_cert = effective_ca_cert.as_ref().map(|ca| ca.path.clone());
+    options.ca_bundle = effective_ca_cert.as_ref().map(|ca| ca.bundle.clone());
+    options.ca_cert_digest = effective_ca_cert.as_ref().map(|ca| *ca.bundle.digest());
 }
 
 pub struct DaemonState {
@@ -519,6 +598,7 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    effective_ca_cert: Option<EffectiveCaCert>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
     network_auto_attach_installed: bool,
@@ -650,6 +730,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            effective_ca_cert: None,
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             // README documents 25s, intentionally below the CLI's 30s IPC
@@ -3914,6 +3995,8 @@ async fn auto_launch(
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
     let mut options = launch_options_from_env();
+    let effective_ca_cert = state.effective_ca_cert.clone();
+    apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
 
     // Use the stream server's viewport dimensions for --window-size so the
@@ -3922,6 +4005,14 @@ async fn auto_launch(
         options.viewport_size = Some(server.viewport().await);
     }
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
+    let cdp = env::var("AGENT_BROWSER_CDP").ok();
+    let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
+    let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
+    validate_ca_cert_launch_mode(
+        &options,
+        engine.as_deref(),
+        cdp.is_some() || auto_connect || provider.is_some(),
+    )?;
     let enable_features = launch_enable_features_from_env();
     let init_script_paths = launch_init_script_paths_from_env();
     let allowed_domains = current_allowed_domains(state).await;
@@ -3946,7 +4037,7 @@ async fn auto_launch(
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file(&state.session_id);
 
-    if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
+    if let Some(cdp) = cdp {
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
             cdp_url: Some(cdp.as_str()),
@@ -3984,7 +4075,7 @@ async fn auto_launch(
         return Ok(());
     }
 
-    if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
+    if auto_connect {
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
             cdp_url: None,
@@ -4030,7 +4121,7 @@ async fn auto_launch(
     // provider API instead of launching a local Chrome instance.  This mirrors
     // the logic in handle_launch() so that auto_launch (triggered by any
     // command arriving before an explicit "launch") honours the provider env.
-    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+    if let Some(provider) = provider {
         let p = provider.to_lowercase();
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
@@ -4114,6 +4205,7 @@ async fn auto_launch(
     })?;
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
+    validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
         cdp_url: None,
@@ -4136,10 +4228,14 @@ async fn auto_launch(
         "local",
         None,
     );
+    if let Some(ref ca) = effective_ca_cert {
+        options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
+    }
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
+    state.effective_ca_cert = effective_ca_cert;
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();
@@ -4320,6 +4416,10 @@ fn launch_options_from_env() -> LaunchOptions {
         ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
+        ca_cert: None,
+        ca_bundle: None,
+        ca_cert_digest: None,
+        prepared_nss_home: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
@@ -4658,6 +4758,7 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 // ---------------------------------------------------------------------------
 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // Absent field falls back to the daemon's spawn-time env (mirrors
     // hideScrollbars/webgpu), keeping the launch hash stable when follow-up
     // commands send launch envelopes without an explicit headed choice.
@@ -4776,6 +4877,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("ignoreHTTPSErrors")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        ca_cert: None,
+        ca_bundle: None,
+        ca_cert_digest: None,
+        prepared_nss_home: None,
         color_scheme: cmd
             .get("colorScheme")
             .and_then(|v| v.as_str())
@@ -4791,6 +4896,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
     };
+    apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
+
+    let external_launch =
+        cdp_url.is_some() || cdp_port.is_some() || auto_connect || provider_name.is_some();
+    validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), external_launch)?;
 
     state.plugin_init_scripts.clear();
     let local_launch =
@@ -4798,6 +4908,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if local_launch {
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
+        validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
     }
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -4855,12 +4966,18 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.browser.is_some() || state.active_provider_session.is_some();
 
     if needs_relaunch {
+        if local_launch {
+            if let Some(ref ca) = effective_ca_cert {
+                launch_options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
+            }
+        }
         if had_browser_before_launch {
             let _ = auto_save_restore_state(state).await;
             close_current_browser(state).await?;
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();
@@ -4873,6 +4990,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         storage_state,
         launch_options.allow_file_access,
         launch_options.executable_path.as_deref(),
+        launch_options.ca_cert.as_deref(),
     )?;
 
     // Store proxy credentials before any local or remote CDP branch enables
@@ -4899,6 +5017,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
@@ -4915,6 +5034,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
@@ -4936,13 +5056,26 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
     if let Some(provider) = provider_name {
         match provider.to_lowercase().as_str() {
-            "ios" => return launch_ios(cmd, state).await,
-            "safari" => return launch_safari(cmd, state).await,
+            "ios" => {
+                let result = launch_ios(cmd, state).await;
+                if result.is_ok() {
+                    state.effective_ca_cert = effective_ca_cert;
+                }
+                return result;
+            }
+            "safari" => {
+                let result = launch_safari(cmd, state).await;
+                if result.is_ok() {
+                    state.effective_ca_cert = effective_ca_cert;
+                }
+                return result;
+            }
             _ => {
                 let command_plugins = plugins_from_command_or_env(cmd);
                 let conn = providers::connect_provider_with_plugins_and_options(
@@ -4993,6 +5126,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                             .await;
                         try_auto_restore_state(state).await;
                         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+                        state.effective_ca_cert = effective_ca_cert;
 
                         if let Some(info) = providers::get_agentcore_info() {
                             return Ok(json!({
@@ -5052,6 +5186,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // origin navigations go through the same domain and proxy handling as
     // normal browser traffic. Explicit storage state wins over auto-restore.
     load_storage_state_or_rollback(state, &storage_state_owned).await?;
+    state.effective_ca_cert = effective_ca_cert;
 
     Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }))
 }
@@ -15025,6 +15160,138 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
             launch_hash(&webgpu, &[], &[], &[], &[], Some("chrome"), "local", None)
         );
+    }
+
+    #[test]
+    fn test_launch_hash_includes_ca_cert() {
+        let base = LaunchOptions::default();
+        let bundle = crate::ca_bundle::test_bundle(b"proxy-ca");
+        let trusted_ca = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ca_bundle: Some(bundle.clone()),
+            ca_cert_digest: Some(*bundle.digest()),
+            ..Default::default()
+        };
+        assert_ne!(
+            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(
+                &trusted_ca,
+                &[],
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "local",
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn test_effective_ca_cert_transitions_distinguish_omission_and_clear() {
+        let mut state = DaemonState::new();
+        state.effective_ca_cert = Some(EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"first"),
+        });
+
+        let omitted = resolve_effective_ca_cert(&json!({}), &state)
+            .unwrap()
+            .expect("omission should retain the effective CA");
+        assert_eq!(omitted.path, "/tmp/first.pem");
+
+        let cleared = resolve_effective_ca_cert(&json!({ "clearCaCert": true }), &state).unwrap();
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn test_provider_compatibility_uses_resolved_ca_cert_transition() {
+        let mut state = DaemonState::new();
+        state.effective_ca_cert = Some(EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"first"),
+        });
+
+        let retained = resolve_effective_ca_cert(&json!({}), &state).unwrap();
+        let mut retained_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut retained_options, &retained);
+        let error =
+            validate_ca_cert_launch_mode(&retained_options, Some("chrome"), true).unwrap_err();
+        assert!(error.contains("CA trust is active for this session"));
+        assert!(error.contains("--no-ca-cert"));
+
+        let cleared = resolve_effective_ca_cert(&json!({ "clearCaCert": true }), &state).unwrap();
+        let mut cleared_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut cleared_options, &cleared);
+        assert!(validate_ca_cert_launch_mode(&cleared_options, Some("chrome"), true).is_ok());
+    }
+
+    #[test]
+    fn test_launch_hash_uses_ca_content_not_path() {
+        let bundle = crate::ca_bundle::test_bundle(b"same");
+        let first = EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: bundle.clone(),
+        };
+        let second = EffectiveCaCert {
+            path: "/tmp/second.pem".to_string(),
+            bundle,
+        };
+        let changed = EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"changed"),
+        };
+        let mut first_options = LaunchOptions::default();
+        let mut second_options = LaunchOptions::default();
+        let mut changed_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut first_options, &Some(first));
+        apply_effective_ca_cert(&mut second_options, &Some(second));
+        apply_effective_ca_cert(&mut changed_options, &Some(changed));
+
+        let hash = |options: &LaunchOptions| {
+            launch_hash(options, &[], &[], &[], &[], Some("chrome"), "local", None)
+        };
+        assert_eq!(hash(&first_options), hash(&second_options));
+        assert_ne!(hash(&first_options), hash(&changed_options));
+    }
+
+    #[test]
+    fn test_effective_ca_cert_rejects_set_and_clear_together() {
+        let state = DaemonState::new();
+        let error = resolve_effective_ca_cert(
+            &json!({
+                "caCert": "/tmp/proxy-ca.pem",
+                "clearCaCert": true
+            }),
+            &state,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Cannot use --ca-cert with --no-ca-cert"));
+    }
+
+    #[test]
+    fn test_daemon_rejects_ca_cert_outside_local_chrome() {
+        let ca = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&ca, Some("chrome"), true).is_err());
+        assert!(validate_ca_cert_launch_mode(&ca, Some("lightpanda"), false).is_err());
+
+        let ignored = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ignore_https_errors: true,
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&ignored, Some("chrome"), false).is_err());
+
+        let profile = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            profile: Some("/tmp/profile".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&profile, Some("chrome"), false).is_err());
     }
 
     #[test]

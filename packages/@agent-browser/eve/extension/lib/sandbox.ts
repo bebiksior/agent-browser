@@ -73,6 +73,7 @@ const APT_CHROMIUM_DEPENDENCIES: readonly (readonly [base: string, t64Variant?: 
   ["libfontconfig1"],
   ["libdbus-1-3", "libdbus-1-3t64"],
   ["libnss3"],
+  ["libnss3-tools"],
   ["libnspr4"],
   ["libatk-bridge2.0-0", "libatk-bridge2.0-0t64"],
   ["libdrm2"],
@@ -89,6 +90,7 @@ const APT_CHROMIUM_DEPENDENCIES: readonly (readonly [base: string, t64Variant?: 
 const DNF_CHROMIUM_DEPENDENCIES = [
   "glib2",
   "nss",
+  "nss-tools",
   "nspr",
   "libxkbcommon",
   "atk",
@@ -115,7 +117,7 @@ const DNF_CHROMIUM_DEPENDENCIES = [
   "dbus-libs",
 ] as const;
 
-const EVE_BOOTSTRAP_REVISION = "3";
+const EVE_BOOTSTRAP_REVISION = "4";
 
 export function agentBrowserRevalidationKey(options: AgentBrowserInstallOptions = {}): string {
   return [

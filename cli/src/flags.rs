@@ -80,6 +80,8 @@ pub struct Config {
     pub hide_scrollbars: Option<bool>,
     pub webgpu: Option<bool>,
     pub ignore_https_errors: Option<bool>,
+    pub ca_cert: Option<String>,
+    pub clear_ca_cert: Option<bool>,
     pub allow_file_access: Option<bool>,
     pub cdp: Option<String>,
     pub auto_connect: Option<bool>,
@@ -106,6 +108,15 @@ pub struct Config {
 
 impl Config {
     fn merge(self, other: Config) -> Config {
+        let (ca_cert, clear_ca_cert) = if other.ca_cert.is_some() {
+            (other.ca_cert, Some(false))
+        } else {
+            match other.clear_ca_cert {
+                Some(true) => (None, Some(true)),
+                Some(false) => (self.ca_cert, Some(false)),
+                None => (self.ca_cert, self.clear_ca_cert),
+            }
+        };
         Config {
             headed: other.headed.or(self.headed),
             json: other.json.or(self.json),
@@ -151,6 +162,8 @@ impl Config {
             hide_scrollbars: other.hide_scrollbars.or(self.hide_scrollbars),
             webgpu: other.webgpu.or(self.webgpu),
             ignore_https_errors: other.ignore_https_errors.or(self.ignore_https_errors),
+            ca_cert,
+            clear_ca_cert,
             allow_file_access: other.allow_file_access.or(self.allow_file_access),
             cdp: other.cdp.or(self.cdp),
             auto_connect: other.auto_connect.or(self.auto_connect),
@@ -220,6 +233,26 @@ fn env_var_bool(name: &str) -> Option<bool> {
         .map(|val| !matches!(val.to_lowercase().as_str(), "0" | "false" | "no" | ""))
 }
 
+fn resolve_ca_cert(
+    config_ca_cert: Option<String>,
+    config_clear_ca_cert: Option<bool>,
+    env_ca_cert: Option<String>,
+    env_clear_ca_cert: Option<bool>,
+) -> (Option<String>, bool) {
+    if let Some(ca_cert) = env_ca_cert {
+        (Some(ca_cert), false)
+    } else if let Some(clear_ca_cert) = env_clear_ca_cert {
+        (
+            if clear_ca_cert { None } else { config_ca_cert },
+            clear_ca_cert,
+        )
+    } else if let Some(ca_cert) = config_ca_cert {
+        (Some(ca_cert), false)
+    } else {
+        (None, config_clear_ca_cert.unwrap_or(false))
+    }
+}
+
 /// Parse an optional boolean value after a flag. Returns (value, consumed_next_arg).
 /// Recognizes "true" as true, "false" as false. Bare flag defaults to true.
 fn parse_bool_arg(args: &[String], i: usize) -> (bool, bool) {
@@ -277,6 +310,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--screenshot-quality",
         "--screenshot-format",
         "--idle-timeout",
+        "--ca-cert",
         "--model",
     ];
     let mut i = 0;
@@ -350,6 +384,8 @@ pub struct Flags {
     pub user_agent: Option<String>,
     pub provider: Option<String>,
     pub ignore_https_errors: bool,
+    pub ca_cert: Option<String>,
+    pub clear_ca_cert: bool,
     pub allow_file_access: bool,
     pub hide_scrollbars: bool,
     pub webgpu: bool,
@@ -397,6 +433,7 @@ pub struct Flags {
     pub cli_user_agent: bool,
     pub cli_proxy: bool,
     pub cli_proxy_bypass: bool,
+    pub cli_ca_cert: bool,
     pub cli_allow_file_access: bool,
     pub cli_hide_scrollbars: bool,
     pub cli_annotate: bool,
@@ -481,6 +518,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
         )
         .unwrap_or_else(|| config.plugins.unwrap_or_default());
 
+    let (ca_cert, clear_ca_cert) = resolve_ca_cert(
+        config.ca_cert,
+        config.clear_ca_cert,
+        env::var("AGENT_BROWSER_CA_CERT").ok(),
+        env_var_bool("AGENT_BROWSER_CLEAR_CA_CERT"),
+    );
+
     let mut flags = Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
@@ -537,6 +581,8 @@ pub fn parse_flags(args: &[String]) -> Flags {
         provider: env::var("AGENT_BROWSER_PROVIDER").ok().or(config.provider),
         ignore_https_errors: env_var_is_truthy("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             || config.ignore_https_errors.unwrap_or(false),
+        ca_cert,
+        clear_ca_cert,
         allow_file_access: env_var_is_truthy("AGENT_BROWSER_ALLOW_FILE_ACCESS")
             || config.allow_file_access.unwrap_or(false),
         hide_scrollbars: env_var_bool("AGENT_BROWSER_HIDE_SCROLLBARS")
@@ -621,6 +667,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_user_agent: false,
         cli_proxy: false,
         cli_proxy_bypass: false,
+        cli_ca_cert: false,
         cli_allow_file_access: false,
         cli_hide_scrollbars: false,
         cli_annotate: false,
@@ -843,6 +890,25 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--ignore-https-errors" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.ignore_https_errors = val;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--ca-cert" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.ca_cert = Some(s.clone());
+                    flags.clear_ca_cert = false;
+                    flags.cli_ca_cert = true;
+                    i += 1;
+                }
+            }
+            "--no-ca-cert" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.clear_ca_cert = val;
+                if val {
+                    flags.ca_cert = None;
+                }
+                flags.cli_ca_cert = true;
                 if consumed {
                     i += 1;
                 }
@@ -1101,6 +1167,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--pin-tab",
         "--no-pin-tab",
         "--force-ownership",
+        "--no-ca-cert",
         "--annotate",
         "--content-boundaries",
         "--confirm-interactive",
@@ -1151,6 +1218,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--screenshot-format",
         "--idle-timeout",
         "--timeout",
+        "--ca-cert",
         "--model",
     ];
 
@@ -1960,6 +2028,159 @@ mod tests {
         };
         let merged = user.merge(project);
         assert_eq!(merged.extensions, Some(vec!["/ext2".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_ca_cert_flag() {
+        let flags = parse_flags(&args("--ca-cert /path/to/ca.crt open example.com"));
+        assert_eq!(flags.ca_cert, Some("/path/to/ca.crt".to_string()));
+        assert!(!flags.clear_ca_cert);
+    }
+
+    #[test]
+    fn test_parse_no_ca_cert_flag() {
+        let flags = parse_flags(&args(
+            "--ca-cert /path/to/ca.crt --no-ca-cert open example.com",
+        ));
+        assert_eq!(flags.ca_cert, None);
+        assert!(flags.clear_ca_cert);
+        assert!(flags.cli_ca_cert);
+    }
+
+    #[test]
+    fn test_parse_ca_cert_flag_no_value() {
+        let flags = parse_flags(&args("--ca-cert"));
+        assert_eq!(flags.ca_cert, None);
+    }
+
+    #[test]
+    fn test_clean_args_removes_ca_cert() {
+        let cleaned = clean_args(&args(
+            "--ca-cert /path/to/ca.crt --no-ca-cert open example.com",
+        ));
+        assert_eq!(cleaned, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_config_merge_ca_cert() {
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project = Config::default();
+        let merged = user.merge(project);
+        assert_eq!(merged.ca_cert, Some("/user/ca.crt".to_string()));
+
+        // Project overrides user
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project = Config {
+            ca_cert: Some("/project/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let merged = user.merge(project);
+        assert_eq!(merged.ca_cert, Some("/project/ca.crt".to_string()));
+    }
+
+    #[test]
+    fn test_config_ca_cert_and_clear_merge_as_one_decision() {
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let cleared = user.merge(project_clear);
+        assert_eq!(cleared.ca_cert, None);
+        assert_eq!(cleared.clear_ca_cert, Some(true));
+
+        let user_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let project_ca = Config {
+            ca_cert: Some("/project/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let selected = user_clear.merge(project_ca);
+        assert_eq!(selected.ca_cert, Some("/project/ca.crt".to_string()));
+        assert_eq!(selected.clear_ca_cert, Some(false));
+
+        let user_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let project_disable_clear = Config {
+            clear_ca_cert: Some(false),
+            ..Config::default()
+        };
+        let disabled = user_clear.merge(project_disable_clear);
+        assert_eq!(disabled.ca_cert, None);
+        assert_eq!(disabled.clear_ca_cert, Some(false));
+    }
+
+    #[test]
+    fn test_ca_cert_precedence() {
+        let cases = [
+            (
+                None,
+                Some(true),
+                Some("/env/ca.crt".to_string()),
+                None,
+                Some("/env/ca.crt".to_string()),
+                false,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                None,
+                None,
+                Some(true),
+                None,
+                true,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                None,
+                None,
+                Some(false),
+                Some("/config/ca.crt".to_string()),
+                false,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                Some(true),
+                None,
+                None,
+                Some("/config/ca.crt".to_string()),
+                false,
+            ),
+            (None, Some(true), None, None, None, true),
+            (None, None, None, None, None, false),
+        ];
+
+        for (
+            config_ca_cert,
+            config_clear_ca_cert,
+            env_ca_cert,
+            env_clear_ca_cert,
+            expected_ca_cert,
+            expected_clear_ca_cert,
+        ) in cases
+        {
+            assert_eq!(
+                resolve_ca_cert(
+                    config_ca_cert,
+                    config_clear_ca_cert,
+                    env_ca_cert,
+                    env_clear_ca_cert,
+                ),
+                (expected_ca_cert, expected_clear_ca_cert)
+            );
+        }
     }
 
     #[test]

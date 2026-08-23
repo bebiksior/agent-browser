@@ -556,6 +556,7 @@ fn apt_dependency_specs() -> Vec<(&'static str, Option<&'static str>)> {
         ("libfontconfig1", None),
         ("libdbus-1-3", Some("libdbus-1-3t64")),
         ("libnss3", None),
+        ("libnss3-tools", None),
         ("libnspr4", None),
         ("libatk-bridge2.0-0", Some("libatk-bridge2.0-0t64")),
         ("libdrm2", None),
@@ -593,6 +594,58 @@ fn resolve_apt_deps() -> Vec<&'static str> {
     resolve_apt_deps_with(package_exists_apt)
 }
 
+fn dnf_dependencies() -> Vec<&'static str> {
+    vec![
+        "nss",
+        "nss-tools",
+        "nspr",
+        "atk",
+        "at-spi2-atk",
+        "cups-libs",
+        "libdrm",
+        "libXcomposite",
+        "libXdamage",
+        "libXrandr",
+        "mesa-libgbm",
+        "pango",
+        "alsa-lib",
+        "libxkbcommon",
+        "libxcb",
+        "libX11-xcb",
+        "libX11",
+        "libXext",
+        "libXcursor",
+        "libXfixes",
+        "libXi",
+        "gtk3",
+        "cairo-gobject",
+        "google-noto-cjk-fonts",
+        "google-noto-emoji-color-fonts",
+        "liberation-fonts",
+    ]
+}
+
+fn yum_dependencies() -> Vec<&'static str> {
+    vec![
+        "nss",
+        "nss-tools",
+        "nspr",
+        "atk",
+        "at-spi2-atk",
+        "cups-libs",
+        "libdrm",
+        "libXcomposite",
+        "libXdamage",
+        "libXrandr",
+        "mesa-libgbm",
+        "pango",
+        "alsa-lib",
+        "libxkbcommon",
+        "google-noto-cjk-fonts",
+        "liberation-fonts",
+    ]
+}
+
 fn install_linux_deps() {
     println!("{}", color::cyan("Installing system dependencies..."));
 
@@ -626,59 +679,9 @@ fn install_linux_deps() {
         // t64 package exists.
         ("apt-get", resolve_apt_deps())
     } else if which_exists("dnf") {
-        (
-            "dnf",
-            vec![
-                "nss",
-                "nspr",
-                "atk",
-                "at-spi2-atk",
-                "cups-libs",
-                "libdrm",
-                "libXcomposite",
-                "libXdamage",
-                "libXrandr",
-                "mesa-libgbm",
-                "pango",
-                "alsa-lib",
-                "libxkbcommon",
-                "libxcb",
-                "libX11-xcb",
-                "libX11",
-                "libXext",
-                "libXcursor",
-                "libXfixes",
-                "libXi",
-                "gtk3",
-                "cairo-gobject",
-                // Fonts
-                "google-noto-cjk-fonts",
-                "google-noto-emoji-color-fonts",
-                "liberation-fonts",
-            ],
-        )
+        ("dnf", dnf_dependencies())
     } else if which_exists("yum") {
-        (
-            "yum",
-            vec![
-                "nss",
-                "nspr",
-                "atk",
-                "at-spi2-atk",
-                "cups-libs",
-                "libdrm",
-                "libXcomposite",
-                "libXdamage",
-                "libXrandr",
-                "mesa-libgbm",
-                "pango",
-                "alsa-lib",
-                "libxkbcommon",
-                // Fonts
-                "google-noto-cjk-fonts",
-                "liberation-fonts",
-            ],
-        )
+        ("yum", yum_dependencies())
     } else {
         eprintln!(
             "{} No supported package manager found (apt-get, dnf, or yum)",
@@ -874,6 +877,7 @@ mod tests {
         assert!(deps.contains(&"libgtk-3-0t64"));
         assert!(!deps.contains(&"libgtk-3-0"));
         assert!(deps.contains(&"libnss3"));
+        assert!(deps.contains(&"libnss3-tools"));
     }
 
     #[test]
@@ -884,6 +888,13 @@ mod tests {
         assert!(!deps.contains(&"libasound2t64"));
         assert!(deps.contains(&"libgtk-3-0"));
         assert!(!deps.contains(&"libgtk-3-0t64"));
+        assert!(deps.contains(&"libnss3-tools"));
+    }
+
+    #[test]
+    fn rpm_dependencies_include_certutil() {
+        assert!(dnf_dependencies().contains(&"nss-tools"));
+        assert!(yum_dependencies().contains(&"nss-tools"));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub fn validate_launch_options(
     storage_state: Option<&str>,
     allow_file_access: bool,
     executable_path: Option<&str>,
+    ca_cert: Option<&str>,
 ) -> Result<(), String> {
     let has_extensions = extensions.map(|e| !e.is_empty()).unwrap_or(false);
 
@@ -45,6 +46,18 @@ pub fn validate_launch_options(
     }
     if storage_state.is_some() && has_extensions {
         return Err("Cannot use storage_state with extensions".to_string());
+    }
+    if ca_cert.is_some() && has_cdp {
+        return Err("--ca-cert requires a locally launched Chromium browser on Linux".to_string());
+    }
+    if ca_cert.is_some() && profile.is_some() {
+        return Err(
+            "--ca-cert cannot be combined with a Chrome profile because isolated CA trust changes the profile's NSS environment"
+                .to_string(),
+        );
+    }
+    if ca_cert.is_some() && !cfg!(target_os = "linux") {
+        return Err("--ca-cert is currently supported only on Linux".to_string());
     }
     if allow_file_access {
         if let Some(path) = executable_path {
@@ -83,6 +96,9 @@ fn validate_lightpanda_options(options: &LaunchOptions) -> Result<(), String> {
     }
     if options.webgpu {
         return Err("WebGPU (--webgpu) is not supported with Lightpanda".to_string());
+    }
+    if options.ca_cert.is_some() {
+        return Err("--ca-cert is not supported with Lightpanda (Chromium only)".to_string());
     }
     if !options.args.is_empty() {
         return Err(
@@ -458,7 +474,13 @@ impl BrowserManager {
                     options.storage_state.as_deref(),
                     options.allow_file_access,
                     options.executable_path.as_deref(),
+                    options.ca_cert.as_deref(),
                 )?;
+                if options.ca_cert.is_some() && options.ignore_https_errors {
+                    return Err(
+                        "--ca-cert cannot be combined with --ignore-https-errors".to_string()
+                    );
+                }
             }
             "lightpanda" => {
                 validate_lightpanda_options(&options)?;
@@ -2755,12 +2777,14 @@ mod tests {
     #[test]
     fn test_validate_launch_options_extensions_and_cdp() {
         let ext = vec!["/path/to/ext".to_string()];
-        assert!(validate_launch_options(Some(&ext), true, None, None, false, None,).is_err());
+        assert!(validate_launch_options(Some(&ext), true, None, None, false, None, None).is_err());
     }
 
     #[test]
     fn test_validate_launch_options_profile_and_cdp() {
-        assert!(validate_launch_options(None, true, Some("/path"), None, false, None,).is_err());
+        assert!(
+            validate_launch_options(None, true, Some("/path"), None, false, None, None).is_err()
+        );
     }
 
     #[test]
@@ -2772,6 +2796,7 @@ mod tests {
             Some("/state.json"),
             false,
             None,
+            None,
         )
         .is_err());
     }
@@ -2779,23 +2804,35 @@ mod tests {
     #[test]
     fn test_validate_launch_options_storage_state_and_extensions() {
         let ext = vec!["/ext".to_string()];
-        assert!(
-            validate_launch_options(Some(&ext), false, None, Some("/state.json"), false, None,)
-                .is_err()
-        );
+        assert!(validate_launch_options(
+            Some(&ext),
+            false,
+            None,
+            Some("/state.json"),
+            false,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     #[test]
     fn test_validate_launch_options_allow_file_access_firefox() {
-        assert!(
-            validate_launch_options(None, false, None, None, true, Some("/usr/bin/firefox"),)
-                .is_err()
-        );
+        assert!(validate_launch_options(
+            None,
+            false,
+            None,
+            None,
+            true,
+            Some("/usr/bin/firefox"),
+            None,
+        )
+        .is_err());
     }
 
     #[test]
     fn test_validate_launch_options_valid() {
-        assert!(validate_launch_options(None, false, None, None, false, None,).is_ok());
+        assert!(validate_launch_options(None, false, None, None, false, None, None).is_ok());
     }
 
     #[test]

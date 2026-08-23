@@ -1,14 +1,17 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
+use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
     child: Child,
     pub ws_url: String,
     temp_user_data_dir: Option<PathBuf>,
+    temp_nss_home: Option<PreparedNssHome>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
     #[cfg(unix)]
     pgid: Option<i32>,
@@ -16,6 +19,40 @@ pub struct ChromeProcess {
     /// hosts. Dropped (and killed) after the Chrome tree is torn down.
     #[cfg(target_os = "linux")]
     xvfb: Option<XvfbServer>,
+}
+
+struct PreparedNssHomeInner {
+    path: PathBuf,
+}
+
+impl Drop for PreparedNssHomeInner {
+    fn drop(&mut self) {
+        for attempt in 0..3 {
+            match std::fs::remove_dir_all(&self.path) {
+                Ok(()) => break,
+                Err(_) if attempt < 2 => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "Warning: failed to clean up temporary CA trust store {}: {}",
+                        self.path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedNssHome {
+    inner: Arc<PreparedNssHomeInner>,
+}
+
+impl PreparedNssHome {
+    fn path(&self) -> &Path {
+        &self.inner.path
+    }
 }
 
 impl ChromeProcess {
@@ -300,6 +337,10 @@ pub struct LaunchOptions {
     pub storage_state: Option<String>,
     pub user_agent: Option<String>,
     pub ignore_https_errors: bool,
+    pub ca_cert: Option<String>,
+    pub(crate) ca_bundle: Option<CaBundle>,
+    pub(crate) ca_cert_digest: Option<[u8; 32]>,
+    pub(crate) prepared_nss_home: Option<PreparedNssHome>,
     pub color_scheme: Option<String>,
     pub download_path: Option<String>,
     /// Hide native scrollbars in headless Chromium screenshots by launching
@@ -357,6 +398,10 @@ impl Default for LaunchOptions {
             storage_state: None,
             user_agent: None,
             ignore_https_errors: false,
+            ca_cert: None,
+            ca_bundle: None,
+            ca_cert_digest: None,
+            prepared_nss_home: None,
             color_scheme: None,
             download_path: None,
             hide_scrollbars: true,
@@ -538,6 +583,120 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_nss_home(ca_cert: &CaBundle) -> Result<PreparedNssHome, String> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let home = std::env::temp_dir().join(format!("agent-browser-nss-{}", uuid::Uuid::new_v4()));
+    let pki_dir = home.join(".local/share/pki");
+    let db_dir = pki_dir.join("nssdb");
+
+    let result = (|| {
+        std::fs::create_dir_all(&db_dir)
+            .map_err(|e| format!("Failed to create temporary CA trust store: {e}"))?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure temporary CA trust store: {e}"))?;
+        symlink(".local/share/pki", home.join(".pki"))
+            .map_err(|e| format!("Failed to configure temporary CA trust store: {e}"))?;
+
+        let db = format!("sql:{}", db_dir.display());
+        run_certutil(
+            &["-N", "--empty-password", "-d", &db],
+            "initialize the NSS database",
+        )?;
+
+        for (index, cert) in ca_cert.certificates().iter().enumerate() {
+            let cert_path = home.join(format!("ca-{index}.der"));
+            std::fs::write(&cert_path, cert.as_ref())
+                .map_err(|e| format!("Failed to stage CA certificate for import: {e}"))?;
+            std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to secure staged CA certificate: {e}"))?;
+            let nickname = format!("agent-browser-ca-{index}");
+            let cert_path_arg = cert_path.display().to_string();
+            let import_result = run_certutil(
+                &[
+                    "-A",
+                    "-d",
+                    &db,
+                    "-t",
+                    "C,,",
+                    "-n",
+                    &nickname,
+                    "-i",
+                    &cert_path_arg,
+                ],
+                "import the CA certificate",
+            );
+            let _ = std::fs::remove_file(&cert_path);
+            import_result?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&home);
+        return Err(error);
+    }
+
+    Ok(PreparedNssHome {
+        inner: Arc::new(PreparedNssHomeInner { path: home }),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_nss_home(_ca_cert: &CaBundle) -> Result<PreparedNssHome, String> {
+    Err("--ca-cert is currently supported only on Linux".to_string())
+}
+
+fn resolve_prepared_nss_home(options: &LaunchOptions) -> Result<Option<PreparedNssHome>, String> {
+    if let Some(home) = options.prepared_nss_home.clone() {
+        return Ok(Some(home));
+    }
+
+    let ca_bundle = match options.ca_bundle.clone() {
+        Some(bundle) => Some(bundle),
+        None => options
+            .ca_cert
+            .as_deref()
+            .map(crate::ca_bundle::load)
+            .transpose()?,
+    };
+
+    ca_bundle.as_ref().map(prepare_nss_home).transpose()
+}
+
+#[cfg(target_os = "linux")]
+fn run_certutil(args: &[&str], action: &str) -> Result<(), String> {
+    let output = Command::new("certutil").args(args).output().map_err(|e| {
+        format!(
+            "Failed to {action}: could not run certutil ({e}). Run agent-browser install --with-deps, or install libnss3-tools on Debian/Ubuntu or nss-tools on RPM Linux."
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if detail.is_empty() {
+        Err(format!(
+            "Failed to {action}: certutil exited with {}. Run agent-browser install --with-deps, or repair libnss3-tools on Debian/Ubuntu or nss-tools on RPM Linux.",
+            output.status
+        ))
+    } else {
+        Err(format!("Failed to {action}: {detail}"))
+    }
+}
+
+fn terminate_launched_chrome(child: &mut Child) {
+    let _ = child.kill();
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
@@ -639,6 +798,17 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     };
 
     #[cfg(target_os = "linux")]
+    let temp_nss_home = match resolve_prepared_nss_home(options) {
+        Ok(home) => home,
+        Err(error) => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let temp_nss_home: Option<PreparedNssHome> = None;
+
+    #[cfg(target_os = "linux")]
     let xvfb = maybe_start_xvfb(options);
 
     let mut cmd = Command::new(chrome_path);
@@ -653,6 +823,11 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     if let Some(ref x) = xvfb {
         cmd.env("DISPLAY", &x.display);
         cmd.env("XAUTHORITY", &x.auth_file);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref home) = temp_nss_home {
+        cmd.env("HOME", home.path());
+        cmd.env("XDG_DATA_HOME", home.path().join(".local/share"));
     }
 
     // Place Chrome in its own process group so we can kill the entire tree
@@ -692,7 +867,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         Err(primary_err) => {
             // Fallback: scrape stderr (legacy behavior) for better diagnostics.
             let stderr = child.stderr.take().ok_or_else(|| {
-                let _ = child.kill();
+                terminate_launched_chrome(&mut child);
                 cleanup_temp_dir(&temp_user_data_dir);
                 "Failed to capture Chrome stderr".to_string()
             })?;
@@ -700,7 +875,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
             match wait_for_ws_url_until(reader, deadline) {
                 Ok(url) => url,
                 Err(fallback_err) => {
-                    let _ = child.kill();
+                    terminate_launched_chrome(&mut child);
                     cleanup_temp_dir(&temp_user_data_dir);
                     return Err(format!(
                         "{}\n(also tried parsing stderr) {}",
@@ -723,6 +898,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         child,
         ws_url,
         temp_user_data_dir,
+        temp_nss_home,
         #[cfg(unix)]
         pgid,
         #[cfg(target_os = "linux")]
@@ -1551,6 +1727,56 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
 
+    fn prepared_nss_home() -> PreparedNssHome {
+        let path = std::env::temp_dir().join(format!(
+            "agent-browser-prepared-nss-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        PreparedNssHome {
+            inner: Arc::new(PreparedNssHomeInner { path }),
+        }
+    }
+
+    #[test]
+    fn test_resolve_prepared_nss_home_without_ca_returns_none() {
+        assert!(resolve_prepared_nss_home(&LaunchOptions::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_resolve_prepared_nss_home_reuses_prepared_home() {
+        let prepared = prepared_nss_home();
+        let expected_path = prepared.path().to_path_buf();
+        let options = LaunchOptions {
+            prepared_nss_home: Some(prepared),
+            ca_cert: Some("/path/that/must/not/be/read".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = resolve_prepared_nss_home(&options).unwrap().unwrap();
+        assert_eq!(resolved.path(), expected_path);
+    }
+
+    #[test]
+    fn test_resolve_prepared_nss_home_surfaces_ca_load_error() {
+        let missing = std::env::temp_dir()
+            .join(format!("missing-ca-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string();
+        let options = LaunchOptions {
+            ca_cert: Some(missing),
+            ..Default::default()
+        };
+
+        let result = resolve_prepared_nss_home(&options);
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("Failed to read CA certificate")
+        ));
+    }
+
     #[cfg(unix)]
     fn spawn_noop_child() -> Child {
         Command::new("/bin/sh")
@@ -2062,6 +2288,7 @@ mod tests {
                 child,
                 ws_url: String::new(),
                 temp_user_data_dir: Some(dir.clone()),
+                temp_nss_home: None,
                 #[cfg(unix)]
                 pgid: None,
                 #[cfg(target_os = "linux")]

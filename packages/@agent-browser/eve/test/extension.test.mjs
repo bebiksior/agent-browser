@@ -127,12 +127,38 @@ test("skips the install probe when autoInstall is false", async () => {
 });
 
 test("applies config-level safety flags to every command", async () => {
-  resetConfig({ allowedDomains: ["example.com", "*.example.com"], maxOutputChars: 5000 });
+  resetConfig({
+    allowedDomains: ["example.com", "*.example.com"],
+    caCert: "/etc/ssl/certs/proxy-ca.pem",
+    clearCaCert: false,
+    maxOutputChars: 5000,
+    proxy: "http://proxy.example.com:8080",
+  });
   const sandbox = fakeSandbox({ id: "flags" });
   await tools.close.execute({}, fakeCtx(sandbox));
   const command = sandbox.commands.at(-1);
   assert.ok(command.includes("--allowed-domains 'example.com,*.example.com'"), command);
+  assert.ok(command.includes("--ca-cert /etc/ssl/certs/proxy-ca.pem"), command);
   assert.ok(command.includes("--max-output 5000"), command);
+  assert.ok(command.includes("--proxy http://proxy.example.com:8080"), command);
+  resetConfig();
+});
+
+test("can explicitly clear retained CA trust", async () => {
+  resetConfig({ clearCaCert: true });
+  const sandbox = fakeSandbox({ id: "clear-ca" });
+  await tools.close.execute({}, fakeCtx(sandbox));
+  assert.ok(sandbox.commands.at(-1).includes("--no-ca-cert"));
+  resetConfig();
+});
+
+test("rejects config CA selection with a simultaneous clear", async () => {
+  resetConfig({ caCert: "/etc/ssl/certs/proxy-ca.pem", clearCaCert: true });
+  const sandbox = fakeSandbox({ id: "select-ca" });
+  await assert.rejects(
+    tools.close.execute({}, fakeCtx(sandbox)),
+    /Cannot use caCert with clearCaCert/,
+  );
   resetConfig();
 });
 

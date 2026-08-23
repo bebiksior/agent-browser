@@ -53,6 +53,8 @@ All fields are optional:
 export default browser({
   // Safety
   allowedDomains: ["example.com", "*.example.com"], // restrict navigation and sub-resources
+  caCert: "/etc/ssl/certs/proxy-ca.pem",
+  clearCaCert: false,
   contentBoundaries: true, // wrap page output in markers the model can recognize
   maxOutputChars: 50_000, // truncate page output
 

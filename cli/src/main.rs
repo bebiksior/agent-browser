@@ -1,3 +1,4 @@
+mod ca_bundle;
 mod chat;
 mod color;
 mod commands;
@@ -28,7 +29,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::OpenProcess;
 
-use commands::{gen_id, parse_command, ParseError};
+use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
     cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
     send_command, walk_daemons, DaemonOptions, Response,
@@ -109,6 +110,36 @@ fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::Pl
     cmd["plugins"] = json!(plugins);
 }
 
+fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
+    cmd.get("action").and_then(|value| value.as_str()) == Some("launch")
+        && (cmd.get("cdpUrl").is_some()
+            || cmd.get("cdpPort").is_some()
+            || cmd.get("provider").is_some()
+            || cmd
+                .get("autoConnect")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false))
+}
+
+fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::Value {
+    let mut launch_cmd = json!({
+        "id": gen_id(),
+        "action": "launch",
+        "provider": provider
+    });
+    launch_cmd["plugins"] = json!(flags.plugins.clone());
+    attach_script_launch_options(&mut launch_cmd, flags);
+    attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
+    attach_restore_config_to_command(&mut launch_cmd, flags);
+    attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
+
+    if let Some(ref cs) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(cs);
+    }
+
+    launch_cmd
+}
+
 fn restore_key_from_flags(flags: &Flags) -> Option<&str> {
     flags.restore.as_deref().or(flags.session_name.as_deref())
 }
@@ -160,10 +191,48 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
         );
     }
 
+    if flags.ca_cert.is_some() && flags.ignore_https_errors {
+        return Some("Cannot use --ca-cert with --ignore-https-errors");
+    }
+    if flags.ca_cert.is_some() && flags.clear_ca_cert {
+        return Some("Cannot use --ca-cert with --no-ca-cert");
+    }
+    if flags.ca_cert.is_some() && flags.cdp.is_some() {
+        return Some(
+            "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.auto_connect {
+        return Some(
+            "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.provider.is_some() {
+        return Some(
+            "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.profile.is_some() {
+        return Some(
+            "Cannot use --ca-cert with --profile because isolated CA trust would change the profile's NSS environment",
+        );
+    }
+    if flags.ca_cert.is_some()
+        && flags
+            .engine
+            .as_deref()
+            .is_some_and(|engine| !engine.eq_ignore_ascii_case("chrome"))
+    {
+        return Some("--ca-cert is supported only with the Chrome engine on Linux");
+    }
+    if flags.ca_cert.is_some() && !cfg!(target_os = "linux") {
+        return Some("--ca-cert is currently supported only on Linux");
+    }
+
     None
 }
 
-fn should_send_local_launch_config(flags: &Flags) -> bool {
+fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
     (flags.headed
         || flags.cli_headed
         || flags.executable_path.is_some()
@@ -172,6 +241,8 @@ fn should_send_local_launch_config(flags: &Flags) -> bool {
         || flags.proxy.is_some()
         || flags.args.is_some()
         || flags.user_agent.is_some()
+        || flags.ca_cert.is_some()
+        || flags.clear_ca_cert
         || flags.allow_file_access
         || should_send_hide_scrollbars_launch_option(
             flags.cli_hide_scrollbars,
@@ -189,6 +260,7 @@ fn should_send_local_launch_config(flags: &Flags) -> bool {
         && flags.cdp.is_none()
         && flags.provider.is_none()
         && !flags.auto_connect
+        && !command_is_external_launch(command)
 }
 
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
@@ -1181,10 +1253,8 @@ fn main() {
     attach_pin_tab_to_command(&mut cmd, &flags);
     attach_restore_config_to_command(&mut cmd, &flags);
 
-    let restore_key = restore_key_from_flags(&flags);
-
     // Validate restore/session persistence name before starting daemon
-    if let Some(name) = restore_key {
+    if let Some(name) = restore_key_from_flags(&flags) {
         if !validation::is_valid_session_name(name) {
             let msg = validation::session_name_error(name);
             if flags.json {
@@ -1248,6 +1318,23 @@ fn main() {
         }
         exit(1);
     }
+
+    if let Some(ref ca_path) = flags.ca_cert {
+        if let Err(msg) = ca_bundle::load(ca_path) {
+            if flags.json {
+                print_json_error(&msg);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), msg);
+            }
+            exit(1);
+        }
+        let canonical = std::path::Path::new(ca_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(ca_path));
+        flags.ca_cert = Some(canonical.display().to_string());
+    }
+
+    let restore_key = restore_key_from_flags(&flags);
 
     // Parse proxy URL to separate server from credentials for the daemon.
     let (proxy_server, proxy_username, proxy_password) = if let Some(ref proxy_str) = flags.proxy {
@@ -1328,6 +1415,8 @@ fn main() {
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
+
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
@@ -1427,6 +1516,8 @@ fn main() {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
 
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
+
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
         }
@@ -1456,19 +1547,7 @@ fn main() {
 
     // Launch with cloud provider if -p flag is set.
     if let Some(ref provider) = flags.provider {
-        let mut launch_cmd = json!({
-            "id": gen_id(),
-            "action": "launch",
-            "provider": provider
-        });
-        launch_cmd["plugins"] = json!(flags.plugins.clone());
-        attach_script_launch_options(&mut launch_cmd, &flags);
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
-        attach_restore_config_to_command(&mut launch_cmd, &flags);
-
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        let launch_cmd = build_provider_launch_command(provider, &flags);
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
@@ -1490,7 +1569,7 @@ fn main() {
     }
 
     // Launch headed browser or configure browser options (without CDP or provider)
-    if should_send_local_launch_config(&flags) {
+    if should_send_local_launch_config(&flags, &cmd) {
         let mut launch_cmd = json!({
             "id": gen_id(),
             "action": "launch",
@@ -1570,6 +1649,8 @@ fn main() {
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
+
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
         if flags.allow_file_access {
             launch_cmd["allowFileAccess"] = json!(true);
@@ -1971,6 +2052,9 @@ mod tests {
         flags.proxy = None;
         flags.args = None;
         flags.user_agent = None;
+        flags.ignore_https_errors = false;
+        flags.ca_cert = None;
+        flags.clear_ca_cert = false;
         flags.allow_file_access = false;
         flags.hide_scrollbars = true;
         flags.cli_hide_scrollbars = false;
@@ -2024,6 +2108,64 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_launch_command_preserves_ca_clear_transition() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+
+        let cmd = build_provider_launch_command("browserbase", &flags);
+
+        assert_eq!(cmd["clearCaCert"], true);
+        assert!(cmd.get("caCert").is_none());
+    }
+
+    #[test]
+    fn test_ca_cert_launch_transition_distinguishes_set_omit_and_clear() {
+        let mut flags = neutral_launch_config_flags();
+        let mut omitted = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut omitted, &flags);
+        assert!(omitted.get("caCert").is_none());
+        assert!(omitted.get("clearCaCert").is_none());
+
+        flags.ca_cert = Some("/tmp/proxy-ca.pem".to_string());
+        let mut set = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut set, &flags);
+        assert_eq!(set["caCert"], "/tmp/proxy-ca.pem");
+        assert!(set.get("clearCaCert").is_none());
+
+        flags.ca_cert = None;
+        flags.clear_ca_cert = true;
+        let mut cleared = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut cleared, &flags);
+        assert!(cleared.get("caCert").is_none());
+        assert_eq!(cleared["clearCaCert"], true);
+    }
+
+    #[test]
+    fn test_connect_launch_command_preserves_ca_clear_transition() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+        let cmd = parse_command(&["connect".to_string(), "9222".to_string()], &flags).unwrap();
+
+        assert_eq!(cmd["cdpPort"], 9222);
+        assert_eq!(cmd["clearCaCert"], true);
+        assert!(!should_send_local_launch_config(&flags, &cmd));
+    }
+
+    #[test]
+    fn test_ca_transition_is_attached_only_to_launch_commands() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+        let mut launch = json!({ "action": "launch", "autoConnect": true });
+        let mut snapshot = json!({ "action": "snapshot" });
+
+        attach_ca_cert_to_launch_command(&mut launch, &flags);
+        attach_ca_cert_to_launch_command(&mut snapshot, &flags);
+
+        assert_eq!(launch["clearCaCert"], true);
+        assert!(snapshot.get("clearCaCert").is_none());
+    }
+
+    #[test]
     fn test_published_schemas_define_pin_tab_boolean() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2045,15 +2187,42 @@ mod tests {
     }
 
     #[test]
+    fn test_published_schemas_define_matching_ca_cert_string() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        let root_ca_cert = &root_schema["properties"]["caCert"];
+        let docs_ca_cert = &docs_schema["properties"]["caCert"];
+        assert_eq!(root_ca_cert["type"], "string");
+        assert_eq!(docs_ca_cert["type"], "string");
+        assert_eq!(root_ca_cert, docs_ca_cert);
+        assert_eq!(root_schema["properties"]["clearCaCert"]["type"], "boolean");
+        assert_eq!(
+            root_schema["properties"]["clearCaCert"],
+            docs_schema["properties"]["clearCaCert"]
+        );
+    }
+
+    #[test]
     fn test_allowed_domains_requests_local_launch_configuration() {
         let mut flags = neutral_launch_config_flags();
-        assert!(!should_send_local_launch_config(&flags));
+        let command = json!({ "action": "snapshot" });
+        assert!(!should_send_local_launch_config(&flags, &command));
 
         flags.allowed_domains = Some(vec!["example.com".to_string()]);
-        assert!(should_send_local_launch_config(&flags));
+        assert!(should_send_local_launch_config(&flags, &command));
 
         flags.cdp = Some("9222".to_string());
-        assert!(!should_send_local_launch_config(&flags));
+        assert!(!should_send_local_launch_config(&flags, &command));
     }
 
     #[test]
@@ -2217,6 +2386,82 @@ mod tests {
         assert_eq!(
             incompatible_launch_mode_error(&launch_mode_flags(false, true, false, false)),
             None
+        );
+    }
+
+    #[test]
+    fn test_incompatible_launch_mode_error_rejects_ca_cert_modes() {
+        let with_ca = |mut flags: Flags| {
+            flags.ca_cert = Some("/tmp/ca.pem".to_string());
+            flags
+        };
+        let mut clear = with_ca(launch_mode_flags(false, false, false, false));
+        clear.clear_ca_cert = true;
+        let mut ignore_errors = with_ca(launch_mode_flags(false, false, false, false));
+        ignore_errors.ignore_https_errors = true;
+        let mut profile = with_ca(launch_mode_flags(false, false, false, false));
+        profile.profile = Some("/tmp/profile".to_string());
+        let mut lightpanda = with_ca(launch_mode_flags(false, false, false, false));
+        lightpanda.engine = Some("lightpanda".to_string());
+
+        let cases = [
+            (
+                with_ca(launch_mode_flags(false, true, false, false)),
+                "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                with_ca(launch_mode_flags(true, false, false, false)),
+                "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                with_ca(launch_mode_flags(false, false, true, false)),
+                "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                ignore_errors,
+                "Cannot use --ca-cert with --ignore-https-errors",
+            ),
+            (
+                profile,
+                "Cannot use --ca-cert with --profile because isolated CA trust would change the profile's NSS environment",
+            ),
+            (
+                lightpanda,
+                "--ca-cert is supported only with the Chrome engine on Linux",
+            ),
+            (clear, "Cannot use --ca-cert with --no-ca-cert"),
+        ];
+
+        for (flags, expected) in cases {
+            assert_eq!(incompatible_launch_mode_error(&flags), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_readme_proxy_ca_config_uses_compatible_options() {
+        let readme = include_str!("../../README.md");
+        let marker = "**Example proxy CA configuration:**";
+        let example = readme
+            .split_once(marker)
+            .and_then(|(_, rest)| rest.split_once("```json"))
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(json, _)| json.trim())
+            .expect("README proxy CA configuration example");
+        let config: flags::Config = serde_json::from_str(example).unwrap();
+        let mut flags = neutral_launch_config_flags();
+        flags.profile = config.profile;
+        flags.ignore_https_errors = config.ignore_https_errors.unwrap_or(false);
+        flags.ca_cert = config.ca_cert;
+        flags.clear_ca_cert = config.clear_ca_cert.unwrap_or(false);
+        flags.cdp = config.cdp;
+        flags.auto_connect = config.auto_connect.unwrap_or(false);
+        flags.provider = config.provider;
+        flags.engine = config.engine;
+
+        let error = incompatible_launch_mode_error(&flags);
+        assert!(
+            error.is_none() || error == Some("--ca-cert is currently supported only on Linux"),
+            "README proxy CA configuration is incompatible: {error:?}"
         );
     }
 

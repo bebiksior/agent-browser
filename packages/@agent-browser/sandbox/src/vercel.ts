@@ -21,6 +21,7 @@ export {
 
 export const CHROMIUM_SYSTEM_DEPS = [
   "nss",
+  "nss-tools",
   "nspr",
   "libxkbcommon",
   "atk",

@@ -141,8 +141,16 @@ async function installIfMissing(sandbox: EveSandboxSession, abortSignal?: AbortS
 function configArgs(): string[] {
   const config = extension.config;
   const args: string[] = [];
+  if (config.caCert !== undefined && config.clearCaCert) {
+    throw new Error("Cannot use caCert with clearCaCert");
+  }
   if (config.allowedDomains !== undefined && config.allowedDomains.length > 0) {
     args.push("--allowed-domains", config.allowedDomains.join(","));
+  }
+  if (config.caCert !== undefined) {
+    args.push("--ca-cert", config.caCert);
+  } else if (config.clearCaCert) {
+    args.push("--no-ca-cert");
   }
   if (config.contentBoundaries) {
     args.push("--content-boundaries");
