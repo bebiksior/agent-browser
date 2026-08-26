@@ -31,6 +31,7 @@ agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 agent-browser pdf <path>              # Save page as PDF
 agent-browser snapshot                # Accessibility tree with refs
 agent-browser eval <js>               # Run JavaScript
+agent-browser target eval <id> <js>   # Run JavaScript in an eligible non-page CDP target
 agent-browser connect <port|url>      # Connect to browser via CDP
 agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
 agent-browser stream status           # Show runtime streaming state and bound port
@@ -211,6 +212,7 @@ agent-browser network requests --type xhr,fetch  # Filter by resource type
 agent-browser network requests --method POST   # Filter by HTTP method
 agent-browser network requests --status 2xx    # Filter by status (200, 2xx, 400-499)
 agent-browser network request <requestId>      # View full request/response detail
+agent-browser network request <requestId> --raw-out request.http  # Write a reconstructed raw HTTP request
 agent-browser network har start                # Start HAR recording (embeds text response bodies)
 agent-browser network har start --content all  # Embed all response bodies (binary as base64)
 agent-browser network har start --content none # Metadata only, no bodies
@@ -262,6 +264,18 @@ agent-browser click @e3         # uses docs's refs
 ### Discarded tab revival
 
 Browsers discard background tabs to save memory, leaving a tab with no renderer to drive. Switching to a discarded tab reactivates it, which reloads the page and resets its unsaved state; the switch result adds `"revived": true` so the reload is visible rather than silent. A tab whose page is paused by a JavaScript dialog is alive rather than discarded: the switch leaves it untouched and adds `"dialogBlocked": true`. Resolve the dialog with `dialog accept` or `dialog dismiss` and the tab keeps its state. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
+
+### CDP target evaluation
+
+`targets tree` lists pages, workers, and Chrome extension background targets with stable CDP target IDs. Use `target eval` to evaluate JavaScript in one of those targets without switching tabs:
+
+```bash
+agent-browser targets tree
+agent-browser target eval <target-id> "self.location.href"
+echo "self.registration.scope" | agent-browser target eval <target-id> --stdin
+```
+
+Target evaluation requires Chromium CDP. It awaits promises, returns the same by-value result or evaluation error as `eval`, and releases its temporary CDP session after the command. Only service workers, shared workers, dedicated workers, and extension background pages in the active browser context are eligible. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused. The command also accepts `-b`/`--base64` for scripts that are difficult to quote.
 
 ### Iframe support
 
@@ -649,7 +663,7 @@ Profiles:
 - `network` - Network routes, request inspection, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` - Console/errors, tracing, profiling, recording, accessibility audits, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
-- `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
+- `tabs` - Back/forward/reload, tabs, windows, frames, targets, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
 - `all` - Every MCP tool, including the full typed CLI parity surface
@@ -682,6 +696,7 @@ Common tools include:
 - `agent_browser_screenshot`
 - `agent_browser_get_url`
 - `agent_browser_eval`
+- `agent_browser_target_eval`
 - `agent_browser_close`
 
 Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, `allowedDomains`, and `idleTimeout`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `idleTimeout` string maps to `--idle-timeout`, accepts values such as `30s`, `5m`, `1h`, or raw milliseconds, and accepts `0` to disable idle shutdown. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.

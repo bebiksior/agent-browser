@@ -3,7 +3,11 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::browser_ownership::{BrowserOwner, WorkerIdentity};
 use super::cdp::client::{CdpClient, ExecutionContextInfo};
+use super::cdp::types::{
+    AttachToTargetParams, AttachToTargetResult, EvaluateParams, EvaluateResult,
+};
 
 const DEFAULT_ISOLATED_WORLD_NAME: &str = "__agent_browser_security_inspection__";
 
@@ -159,6 +163,84 @@ impl TargetGraph {
             .iter()
             .find(|target| target.target_id == target_id)
     }
+}
+
+const TARGET_EVAL_TYPES: &[&str] = &[
+    "service_worker",
+    "shared_worker",
+    "worker",
+    "background_page",
+];
+
+/// Select a non-page execution target that is safe for this worker to attach.
+/// Shared default contexts are rejected because they do not provide a stable
+/// context boundary between independently managed browser sessions.
+pub fn select_target_for_evaluation(
+    graph: &TargetGraph,
+    target_id: &str,
+    active_target_id: &str,
+    dedicated_browser: bool,
+    session: &str,
+    worker: &WorkerIdentity,
+    owners: &[BrowserOwner],
+) -> Result<TargetNode, String> {
+    let target = graph
+        .get(target_id)
+        .ok_or_else(|| format!("Unknown target ID: {target_id}"))?;
+    if !TARGET_EVAL_TYPES.contains(&target.target_type.as_str()) {
+        return Err(format!(
+            "Target {} has unsupported type '{}'; target eval accepts only service_worker, shared_worker, worker, and background_page targets",
+            target.target_id, target.target_type
+        ));
+    }
+    let active = graph.get(active_target_id).ok_or_else(|| {
+        format!("Active target is missing from the target graph: {active_target_id}")
+    })?;
+    let context_id = match (
+        active.browser_context_id.as_deref(),
+        target.browser_context_id.as_deref(),
+    ) {
+        (Some(active_context), Some(target_context)) if active_context == target_context => {
+            Some(active_context)
+        }
+        (None, None) if dedicated_browser => None,
+        (None, None) => {
+            return Err(
+                "Target evaluation in the default browser context requires a dedicated locally launched browser; shared CDP sessions are ambiguous"
+                    .to_string(),
+            )
+        }
+        _ => {
+            return Err(format!(
+                "Target {} is not in the active browser context",
+                target.target_id
+            ))
+        }
+    };
+
+    let conflicting_owner = owners.iter().find(|owner| {
+        graph.get(&owner.target_id).is_some_and(|owned_target| {
+            owned_target.browser_context_id.as_deref() == context_id
+                && (owner.session != session || !owner.worker.same_principal(worker))
+        })
+    });
+    if conflicting_owner.is_some() {
+        return Err(
+            "Target evaluation refused because another session or worker owns a target in the active browser context"
+                .to_string(),
+        );
+    }
+
+    Ok(target.clone())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetEvaluation {
+    pub target_id: String,
+    pub target_type: String,
+    pub url: String,
+    pub result: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -720,9 +802,145 @@ pub async fn collect_target_graph(client: &CdpClient) -> Result<TargetGraph, Str
     parse_target_graph(&result)
 }
 
+/// Evaluate JavaScript in a specific CDP target using a temporary flattened
+/// session. This works for targets such as service workers and extension
+/// background targets without changing the active page or tab binding.
+pub async fn evaluate_in_target(
+    client: &CdpClient,
+    target: &TargetNode,
+    expression: &str,
+) -> Result<TargetEvaluation, String> {
+    let attached: AttachToTargetResult = client
+        .send_command_typed(
+            "Target.attachToTarget",
+            &AttachToTargetParams {
+                target_id: target.target_id.clone(),
+                flatten: true,
+            },
+            None,
+        )
+        .await?;
+
+    let evaluation: Result<EvaluateResult, String> = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: expression.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            },
+            Some(&attached.session_id),
+        )
+        .await;
+    // A target can disappear after evaluation, so detach is best-effort. The
+    // temporary session is also released automatically when its target closes.
+    let _ = client
+        .send_command(
+            "Target.detachFromTarget",
+            Some(json!({ "sessionId": attached.session_id })),
+            None,
+        )
+        .await;
+
+    let evaluation = evaluation?;
+    if let Some(ref details) = evaluation.exception_details {
+        let message = details
+            .exception
+            .as_ref()
+            .and_then(|exception| exception.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!(
+            "Evaluation error in target {}: {}",
+            target.target_id, message
+        ));
+    }
+
+    Ok(TargetEvaluation {
+        target_id: target.target_id.clone(),
+        target_type: target.target_type.clone(),
+        url: target.url.clone(),
+        result: evaluation.result.value.unwrap_or(Value::Null),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_target() -> TargetNode {
+        TargetNode {
+            target_id: "WORKER_TARGET".to_string(),
+            target_type: "service_worker".to_string(),
+            title: "Service Worker chrome-extension://abc/background.js".to_string(),
+            url: "chrome-extension://abc/background.js".to_string(),
+            attached: Some(true),
+            browser_context_id: None,
+            opener_id: None,
+            opener_frame_id: None,
+            parent_frame_id: None,
+            can_access_opener: None,
+            subtype: None,
+            child_target_ids: Vec::new(),
+            metadata: json!({}),
+        }
+    }
+
+    async fn mock_target_evaluation(
+        runtime_result: Value,
+    ) -> (CdpClient, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = commands.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sender, mut receiver) = ws.split();
+            while let Some(Ok(message)) = receiver.next().await {
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Ping(payload) => {
+                        let _ = sender.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let Some(id) = command.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                captured.lock().unwrap().push(command.clone());
+                let result = match command.get("method").and_then(Value::as_str) {
+                    Some("Target.getTargets") => json!({
+                        "targetInfos": [{
+                            "targetId": "WORKER_TARGET",
+                            "type": "service_worker",
+                            "title": "Service Worker chrome-extension://abc/background.js",
+                            "url": "chrome-extension://abc/background.js",
+                            "attached": true
+                        }]
+                    }),
+                    Some("Target.attachToTarget") => json!({ "sessionId": "TARGET_SESSION" }),
+                    Some("Runtime.evaluate") => runtime_result.clone(),
+                    Some("Target.detachFromTarget") => json!({}),
+                    method => panic!("unexpected CDP method: {method:?}"),
+                };
+                sender
+                    .send(Message::Text(
+                        json!({ "id": id, "result": result }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        (client, commands)
+    }
 
     #[test]
     fn merges_oopif_tree_and_preserves_parent_session() {
@@ -814,5 +1032,288 @@ mod tests {
         assert_eq!(popup.opener_frame_id.as_deref(), Some("frame-1"));
         assert_eq!(popup.browser_context_id.as_deref(), Some("context-1"));
         assert_eq!(popup.can_access_opener, Some(false));
+    }
+
+    #[test]
+    fn target_eval_rejects_page_targets() {
+        let graph = parse_target_graph(&json!({
+            "targetInfos": [{
+                "targetId": "PAGE",
+                "type": "page",
+                "title": "Page",
+                "url": "https://example.test/"
+            }]
+        }))
+        .unwrap();
+
+        let error = select_target_for_evaluation(
+            &graph,
+            "PAGE",
+            "PAGE",
+            true,
+            "session-a",
+            &WorkerIdentity::new("worker-a"),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unsupported type 'page'"));
+    }
+
+    #[test]
+    fn target_eval_rejects_a_different_browser_context() {
+        let graph = parse_target_graph(&json!({
+            "targetInfos": [
+                {
+                    "targetId": "PAGE",
+                    "type": "page",
+                    "title": "Page",
+                    "url": "https://example.test/",
+                    "browserContextId": "context-a"
+                },
+                {
+                    "targetId": "WORKER_TARGET",
+                    "type": "service_worker",
+                    "title": "Worker",
+                    "url": "https://other.test/sw.js",
+                    "browserContextId": "context-b"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let error = select_target_for_evaluation(
+            &graph,
+            "WORKER_TARGET",
+            "PAGE",
+            false,
+            "session-a",
+            &WorkerIdentity::new("worker-a"),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not in the active browser context"));
+    }
+
+    #[test]
+    fn target_eval_rejects_cross_session_or_worker_context_ownership() {
+        let graph = parse_target_graph(&json!({
+            "targetInfos": [
+                {
+                    "targetId": "PAGE",
+                    "type": "page",
+                    "title": "Page",
+                    "url": "https://example.test/",
+                    "browserContextId": "context-a"
+                },
+                {
+                    "targetId": "WORKER_TARGET",
+                    "type": "service_worker",
+                    "title": "Worker",
+                    "url": "https://example.test/sw.js",
+                    "browserContextId": "context-a"
+                },
+                {
+                    "targetId": "OTHER_PAGE",
+                    "type": "page",
+                    "title": "Other page",
+                    "url": "https://example.test/other",
+                    "browserContextId": "context-a"
+                }
+            ]
+        }))
+        .unwrap();
+        for owner in [
+            BrowserOwner {
+                session: "session-a".to_string(),
+                target_id: "OTHER_PAGE".to_string(),
+                url: "https://example.test/other".to_string(),
+                worker: WorkerIdentity::new("worker-b"),
+                claimed_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            BrowserOwner {
+                session: "session-b".to_string(),
+                target_id: "OTHER_PAGE".to_string(),
+                url: "https://example.test/other".to_string(),
+                worker: WorkerIdentity::new("worker-a"),
+                claimed_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        ] {
+            let error = select_target_for_evaluation(
+                &graph,
+                "WORKER_TARGET",
+                "PAGE",
+                false,
+                "session-a",
+                &WorkerIdentity::new("worker-a"),
+                &[owner],
+            )
+            .unwrap_err();
+
+            assert!(error.contains("another session or worker"));
+        }
+    }
+
+    #[test]
+    fn target_eval_rejects_ambiguous_shared_default_context() {
+        let mut worker = worker_target();
+        worker.target_type = "worker".to_string();
+        let graph = TargetGraph {
+            root_target_ids: vec!["PAGE".to_string(), worker.target_id.clone()],
+            targets: vec![
+                TargetNode {
+                    target_id: "PAGE".to_string(),
+                    target_type: "page".to_string(),
+                    title: "Page".to_string(),
+                    url: "https://example.test/".to_string(),
+                    attached: Some(true),
+                    browser_context_id: None,
+                    opener_id: None,
+                    opener_frame_id: None,
+                    parent_frame_id: None,
+                    can_access_opener: None,
+                    subtype: None,
+                    child_target_ids: Vec::new(),
+                    metadata: json!({}),
+                },
+                worker,
+            ],
+        };
+
+        let error = select_target_for_evaluation(
+            &graph,
+            "WORKER_TARGET",
+            "PAGE",
+            false,
+            "session-a",
+            &WorkerIdentity::new("worker-a"),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("requires a dedicated locally launched browser"));
+    }
+
+    #[test]
+    fn target_eval_allows_current_owner_in_active_context() {
+        let graph = parse_target_graph(&json!({
+            "targetInfos": [
+                {
+                    "targetId": "PAGE",
+                    "type": "page",
+                    "title": "Page",
+                    "url": "https://example.test/",
+                    "browserContextId": "context-a"
+                },
+                {
+                    "targetId": "WORKER_TARGET",
+                    "type": "background_page",
+                    "title": "Background page",
+                    "url": "chrome-extension://abc/background.html",
+                    "browserContextId": "context-a"
+                }
+            ]
+        }))
+        .unwrap();
+        let owners = [BrowserOwner {
+            session: "session-a".to_string(),
+            target_id: "PAGE".to_string(),
+            url: "https://example.test/".to_string(),
+            worker: WorkerIdentity::new("worker-a"),
+            claimed_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+
+        let target = select_target_for_evaluation(
+            &graph,
+            "WORKER_TARGET",
+            "PAGE",
+            false,
+            "session-a",
+            &WorkerIdentity::new("worker-a"),
+            &owners,
+        )
+        .unwrap();
+
+        assert_eq!(target.target_id, "WORKER_TARGET");
+    }
+
+    #[tokio::test]
+    async fn target_eval_uses_requested_session_and_detaches() {
+        let (client, commands) = mock_target_evaluation(json!({
+            "result": {
+                "type": "object",
+                "value": { "scope": "chrome-extension://abc/" }
+            }
+        }))
+        .await;
+
+        let evaluation = evaluate_in_target(
+            &client,
+            &worker_target(),
+            "Promise.resolve({ scope: self.registration.scope })",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluation.target_id, "WORKER_TARGET");
+        assert_eq!(evaluation.target_type, "service_worker");
+        assert_eq!(evaluation.url, "chrome-extension://abc/background.js");
+        assert_eq!(
+            evaluation.result,
+            json!({ "scope": "chrome-extension://abc/" })
+        );
+        let commands = commands.lock().unwrap();
+        let runtime = commands
+            .iter()
+            .find(|command| command["method"] == "Runtime.evaluate")
+            .unwrap();
+        assert_eq!(runtime["sessionId"], "TARGET_SESSION");
+        assert_eq!(runtime["params"]["awaitPromise"], true);
+        assert_eq!(runtime["params"]["returnByValue"], true);
+        let detach = commands
+            .iter()
+            .find(|command| command["method"] == "Target.detachFromTarget")
+            .unwrap();
+        assert_eq!(detach["params"]["sessionId"], "TARGET_SESSION");
+    }
+
+    #[tokio::test]
+    async fn target_eval_reports_exception_and_still_detaches() {
+        let (client, commands) = mock_target_evaluation(json!({
+            "result": { "type": "object", "subtype": "error" },
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "lineNumber": 0,
+                "columnNumber": 0,
+                "exception": {
+                    "type": "object",
+                    "subtype": "error",
+                    "description": "Error: worker failed"
+                }
+            }
+        }))
+        .await;
+
+        let error = evaluate_in_target(
+            &client,
+            &worker_target(),
+            "throw new Error('worker failed')",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Evaluation error in target WORKER_TARGET: Error: worker failed"
+        );
+        assert!(commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command["method"] == "Target.detachFromTarget"));
     }
 }

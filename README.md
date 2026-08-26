@@ -137,6 +137,7 @@ agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 agent-browser pdf <path>              # Save as PDF
 agent-browser snapshot                # Accessibility tree with refs (best for AI)
 agent-browser eval <js>               # Run JavaScript (-b for base64, --stdin for piped input)
+agent-browser target eval <id> <js>   # Run JavaScript in an eligible non-page CDP target
 agent-browser connect <port>          # Connect to browser via CDP
 agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
 agent-browser stream status           # Show runtime streaming state and bound port
@@ -315,11 +316,14 @@ agent-browser network requests --type xhr,fetch  # Filter by resource type
 agent-browser network requests --method POST   # Filter by HTTP method
 agent-browser network requests --status 2xx    # Filter by status (200, 2xx, 400-499)
 agent-browser network request <requestId>      # View full request/response detail
+agent-browser network request <requestId> --raw-out request.http  # Write a reconstructed raw HTTP request
 agent-browser network har start                # Start HAR recording (embeds text response bodies)
 agent-browser network har start --content all  # Embed all response bodies (binary as base64)
 agent-browser network har start --content none # Metadata only, no bodies
 agent-browser network har stop [output.har]    # Stop and save HAR (temp path if omitted)
 ```
+
+`network request <requestId> --raw-out <path>` writes a reconstructed raw HTTP request for raw-request consumers or manual translation to curl; it does not write a curl command or original wire bytes. The command refuses to overwrite an existing file and creates it with mode `0600` on Unix.
 
 ### Tabs & Windows
 
@@ -354,6 +358,18 @@ Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a di
 agent-browser frame <sel>             # Switch to iframe
 agent-browser frame main              # Back to main frame
 ```
+
+### CDP targets
+
+Use `targets tree` to find pages, workers, and Chrome extension background targets, then evaluate JavaScript in one target without changing the active tab:
+
+```bash
+agent-browser targets tree
+agent-browser target eval <target-id> "self.location.href"
+echo "self.registration.scope" | agent-browser target eval <target-id> --stdin
+```
+
+Target evaluation uses the same by-value result and exception behavior as `eval`, awaits promises, and releases its temporary CDP session after the command. It accepts only service workers, shared workers, dedicated workers, and extension background pages in the active browser context. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused.
 
 ### Dialogs
 
@@ -535,7 +551,7 @@ Profiles:
 - `network` — Network routes, request inspection, HAR, headers, credentials, offline
 - `state` — Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` — Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
-- `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
+- `tabs` — Back/forward/reload, tabs, windows, frames, targets, dialogs
 - `react` — React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
 - `all` — Every MCP tool, including the full typed CLI parity surface
@@ -553,6 +569,7 @@ Common tools include:
 - `agent_browser_screenshot`
 - `agent_browser_get_url`
 - `agent_browser_eval`
+- `agent_browser_target_eval`
 - `agent_browser_close`
 
 Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.

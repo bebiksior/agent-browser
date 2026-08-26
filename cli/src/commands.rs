@@ -89,6 +89,38 @@ fn normalize_navigation_url(url: &str) -> String {
     }
 }
 
+fn resolve_script_input(
+    script_parts: &[&str],
+    is_base64: bool,
+    is_stdin: bool,
+    base64_usage: &'static str,
+) -> Result<String, ParseError> {
+    if is_stdin {
+        let stdin = io::stdin();
+        return Ok(stdin
+            .lock()
+            .lines()
+            .map(|line| line.unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    let raw_script = script_parts.join(" ");
+    if !is_base64 {
+        return Ok(raw_script);
+    }
+    let decoded = STANDARD
+        .decode(&raw_script)
+        .map_err(|_| ParseError::InvalidValue {
+            message: "Invalid base64 encoding".to_string(),
+            usage: base64_usage,
+        })?;
+    String::from_utf8(decoded).map_err(|_| ParseError::InvalidValue {
+        message: "Base64 decoded to invalid UTF-8".to_string(),
+        usage: base64_usage,
+    })
+}
+
 fn apply_state_selection_args(rest: &[&str], command: &mut Value) -> Result<(), ParseError> {
     if rest.contains(&"--cookies-only") {
         command["categories"] = json!("cookies");
@@ -170,6 +202,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "window"
             | "frame"
             | "frames"
+            | "target"
             | "targets"
             | "postmessage"
             | "evidence"
@@ -1051,33 +1084,12 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 });
             }
 
-            let script = if is_stdin {
-                // Read script from stdin
-                let stdin = io::stdin();
-                let lines: Vec<String> = stdin
-                    .lock()
-                    .lines()
-                    .map(|l| l.unwrap_or_default())
-                    .collect();
-                lines.join("\n")
-            } else {
-                let raw_script = script_parts.join(" ");
-                if is_base64 {
-                    let decoded =
-                        STANDARD
-                            .decode(&raw_script)
-                            .map_err(|_| ParseError::InvalidValue {
-                                message: "Invalid base64 encoding".to_string(),
-                                usage: "eval -b <base64-encoded-script>",
-                            })?;
-                    String::from_utf8(decoded).map_err(|_| ParseError::InvalidValue {
-                        message: "Base64 decoded to invalid UTF-8".to_string(),
-                        usage: "eval -b <base64-encoded-script>",
-                    })?
-                } else {
-                    raw_script
-                }
-            };
+            let script = resolve_script_input(
+                &script_parts,
+                is_base64,
+                is_stdin,
+                "eval -b <base64-encoded-script>",
+            )?;
             let mut command = json!({ "id": id, "action": "evaluate", "script": script });
             if let Some(frame) = frame {
                 command["frameId"] = json!(frame);
@@ -1788,6 +1800,53 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             value => Err(ParseError::UnknownSubcommand {
                 subcommand: value.to_string(),
                 valid_options: &["tree", "list"],
+            }),
+        },
+
+        "target" => match rest.first().copied() {
+            Some("eval") => {
+                let target_id = rest.get(1).ok_or(ParseError::MissingArguments {
+                    context: "target eval".to_string(),
+                    usage: "target eval <target-id> [--base64|--stdin] <script>",
+                })?;
+                let mut is_base64 = false;
+                let mut is_stdin = false;
+                let mut script_parts = Vec::new();
+                let mut i = 2;
+                while i < rest.len() {
+                    match rest[i] {
+                        "-b" | "--base64" => is_base64 = true,
+                        "--stdin" => is_stdin = true,
+                        value => script_parts.push(value),
+                    }
+                    i += 1;
+                }
+                let script = resolve_script_input(
+                    &script_parts,
+                    is_base64,
+                    is_stdin,
+                    "target eval <target-id> -b <base64-encoded-script>",
+                )?;
+                if script.is_empty() {
+                    return Err(ParseError::MissingArguments {
+                        context: "target eval".to_string(),
+                        usage: "target eval <target-id> [--base64|--stdin] <script>",
+                    });
+                }
+                Ok(json!({
+                    "id": id,
+                    "action": "evaluate",
+                    "targetId": target_id,
+                    "script": script,
+                }))
+            }
+            Some(value) => Err(ParseError::UnknownSubcommand {
+                subcommand: value.to_string(),
+                valid_options: &["eval"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "target".to_string(),
+                usage: "target eval <target-id> [--base64|--stdin] <script>",
             }),
         },
 
@@ -3540,7 +3599,7 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         Some("request") => {
             let request_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "network request".to_string(),
-                usage: "network request <requestId>",
+                usage: "network request <requestId> [--raw-out <path>]",
             })?;
             let mut cmd = json!({ "id": id, "action": "request_detail", "requestId": request_id });
             if let Some(index) = rest.iter().position(|value| *value == "--raw-out") {
@@ -4853,6 +4912,18 @@ mod tests {
     }
 
     #[test]
+    fn test_network_request_detail_raw_out() {
+        let cmd = parse_command(
+            &args("network request 1234.5 --raw-out ./request.http"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "request_detail");
+        assert_eq!(cmd["requestId"], "1234.5");
+        assert_eq!(cmd["rawOut"], "./request.http");
+    }
+
+    #[test]
     fn test_network_request_detail_requires_id() {
         let result = parse_command(&args("network request"), &default_flags());
         assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
@@ -5342,6 +5413,36 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ParseError::InvalidValue { .. }));
         assert!(err.format().contains("Invalid base64"));
+    }
+
+    #[test]
+    fn test_target_eval_basic() {
+        let cmd = parse_command(
+            &args("target eval SERVICE_WORKER_ID self.registration.scope"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "evaluate");
+        assert_eq!(cmd["targetId"], "SERVICE_WORKER_ID");
+        assert_eq!(cmd["script"], "self.registration.scope");
+    }
+
+    #[test]
+    fn test_target_eval_base64() {
+        let cmd = parse_command(
+            &args("target eval SERVICE_WORKER_ID -b c2VsZi5sb2NhdGlvbi5ocmVm"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "evaluate");
+        assert_eq!(cmd["targetId"], "SERVICE_WORKER_ID");
+        assert_eq!(cmd["script"], "self.location.href");
+    }
+
+    #[test]
+    fn test_target_eval_requires_script() {
+        let result = parse_command(&args("target eval SERVICE_WORKER_ID"), &default_flags());
+        assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
     }
 
     #[test]

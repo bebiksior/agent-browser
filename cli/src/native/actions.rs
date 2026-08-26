@@ -3051,6 +3051,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         let safe_during_dialog = (skip_launch && !read_touches_active_tab)
+            || (action == "evaluate" && cmd.get("targetId").is_some())
             || matches!(
                 action,
                 "dialog"
@@ -5503,6 +5504,33 @@ async fn handle_content(state: &DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    if let Some(target_id) = cmd.get("targetId").and_then(Value::as_str) {
+        let mgr = state
+            .browser
+            .as_ref()
+            .ok_or("Target evaluation requires a Chromium CDP backend")?;
+        let script = cmd
+            .get("script")
+            .and_then(Value::as_str)
+            .ok_or("Missing 'script' parameter")?;
+        let graph = super::security_inspection::collect_target_graph(&mgr.client).await?;
+        let owners = super::browser_ownership::list()
+            .map_err(|error| format!("Failed to read browser ownership: {}", error))?;
+        let target = super::security_inspection::select_target_for_evaluation(
+            &graph,
+            target_id,
+            mgr.active_target_id()?,
+            !mgr.is_cdp_connection(),
+            &state.session_id,
+            &current_worker_identity(),
+            &owners,
+        )?;
+        let result =
+            super::security_inspection::evaluate_in_target(&mgr.client, &target, script).await?;
+        return serde_json::to_value(result)
+            .map_err(|error| format!("Failed to serialize target evaluation: {}", error));
+    }
+
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             let script = cmd
@@ -12290,6 +12318,20 @@ async fn handle_requests(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     Ok(json!({ "requests": requests }))
 }
 
+fn request_authority(url: &url::Url) -> Result<String, String> {
+    let host = match url.host() {
+        Some(url::Host::Domain(host)) => host.to_string(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => return Err("Cannot reconstruct raw request URL without a host".to_string()),
+    };
+
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
 async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let request_id = cmd
         .get("requestId")
@@ -12344,6 +12386,7 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
     }
 
     if let Some(path) = cmd.get("rawOut").and_then(Value::as_str) {
+        // CDP exposes decoded metadata, so this is an HTTP/1.1 reconstruction.
         let url = url::Url::parse(&entry.url)
             .map_err(|error| format!("Cannot reconstruct raw request URL: {}", error))?;
         let mut target = url.path().to_string();
@@ -12357,7 +12400,7 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
             .as_object()
             .is_some_and(|headers| headers.keys().any(|name| name.eq_ignore_ascii_case("host")))
         {
-            raw.push_str(&format!("Host: {}\r\n", url.host_str().unwrap_or_default()));
+            raw.push_str(&format!("Host: {}\r\n", request_authority(&url)?));
         }
         if let Some(headers) = entry.headers.as_object() {
             for (name, value) in headers {
@@ -13340,6 +13383,15 @@ mod tests {
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn raw_request_authority_preserves_port_and_ipv6_brackets() {
+        let ipv4 = url::Url::parse("http://127.0.0.1:8080/path").unwrap();
+        assert_eq!(request_authority(&ipv4).unwrap(), "127.0.0.1:8080");
+
+        let ipv6 = url::Url::parse("http://[::1]:8080/path").unwrap();
+        assert_eq!(request_authority(&ipv6).unwrap(), "[::1]:8080");
+    }
 
     /// A binding-recovery failure must tear the connection down: the attach
     /// paths set `state.browser` before calling this, so returning the error

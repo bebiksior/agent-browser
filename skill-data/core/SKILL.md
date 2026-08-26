@@ -351,6 +351,7 @@ agent-browser frames tree
 agent-browser frame inspect <frame-id>
 agent-browser eval --frame <frame-id> --world isolated 'location.href'
 agent-browser targets tree
+agent-browser target eval <target-id> 'self.location.href'
 
 agent-browser postmessage monitor start
 # exercise the UI
@@ -366,6 +367,8 @@ agent-browser evidence stop
 ```
 
 Evidence bundles default to sanitized `redacted/` artifacts plus a root manifest with SHA-256 hashes and explicit gaps. Screenshots are omitted unless a separately pixel-redacted source exists. Add `--include-private` to `evidence start` only when owner-only raw headers, bodies, cookies, console values, and screenshots are required.
+
+`targets tree` includes pages, workers, and Chrome extension background targets. Use `target eval <target-id> <script>` to inspect an eligible non-page execution target without switching tabs. Target evaluation accepts service workers, shared workers, dedicated workers, and extension background pages only when they share the active browser context. It rejects shared CDP default contexts and any context containing a target owned by another session or worker. Use a dedicated locally launched browser when the target has no browser context ID. Evaluation awaits promises and follows normal `eval` result and exception behavior. Prefer `--stdin` for multiline JavaScript.
 
 Use selective state and clean contexts for multi-role tests:
 

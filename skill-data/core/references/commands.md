@@ -193,11 +193,14 @@ agent-browser network unroute [url]            # Remove routes
 agent-browser network requests                 # View tracked requests
 agent-browser network requests --filter api    # Filter requests
 agent-browser network request <requestId>      # Full request/response detail incl. body
+agent-browser network request <requestId> --raw-out request.http  # Reconstructed raw HTTP request (mode 0600 on Unix)
 agent-browser network har start                # Record traffic (embeds text response bodies)
 agent-browser network har start --content all  # Embed all bodies (binary as base64)
 agent-browser network har start --content none # Sizes and headers only
 agent-browser network har stop [output.har]    # Stop and save HAR
 ```
+
+`network request <requestId> --raw-out <path>` writes a reconstructed raw HTTP request for raw-request consumers or manual translation to curl; it does not write a curl command or original wire bytes. The command refuses to overwrite an existing file and creates it with mode `0600` on Unix.
 
 ## Tabs and Windows
 
@@ -282,6 +285,8 @@ agent-browser dialog status         # Check if a dialog is currently open
 agent-browser eval "document.title"          # Simple expressions only
 agent-browser eval -b "<base64>"             # Any JavaScript (base64 encoded)
 agent-browser eval --stdin                   # Read script from stdin
+agent-browser targets tree                   # Find pages, workers, and background targets
+agent-browser target eval <target-id> <js>   # Evaluate in an eligible non-page CDP target
 ```
 
 Use `-b`/`--base64` or `--stdin` for reliable execution. Shell escaping with nested quotes and special characters is error-prone.
@@ -296,6 +301,8 @@ const links = document.querySelectorAll('a');
 Array.from(links).map(a => a.href);
 EOF
 ```
+
+`target eval` is the non-page CDP-target equivalent of `eval`. It accepts service workers, shared workers, dedicated workers, and extension background pages only when they share the active browser context. It rejects shared CDP default contexts and any context containing a target owned by another session or worker; use a dedicated locally launched browser when the target has no browser context ID. The command awaits promises and returns the same by-value result or evaluation error without changing the active tab. It accepts `-b`/`--base64` and `--stdin` for scripts that are difficult to quote.
 
 ## Authentication and Plugins
 
@@ -359,7 +366,7 @@ Profiles:
 - `network` - Network routes, request inspection, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` - Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
-- `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
+- `tabs` - Back/forward/reload, tabs, windows, frames, targets, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
 - `all` - Every MCP tool, including the full typed CLI parity surface
@@ -377,6 +384,7 @@ Common tools include:
 - `agent_browser_screenshot`
 - `agent_browser_get_url`
 - `agent_browser_eval`
+- `agent_browser_target_eval`
 - `agent_browser_close`
 
 Tool calls use the same config files and environment variables as the CLI. Each tool accepts typed arguments plus `extraArgs` for advanced CLI flags and exact CLI parity. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the `session` tool argument or `AGENT_BROWSER_SESSION` to isolate browser state.

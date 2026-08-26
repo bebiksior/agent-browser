@@ -107,6 +107,7 @@ const TOOL_DIALOG_HISTORY: &str = "agent_browser_dialog_history";
 const TOOL_FRAMES: &str = "agent_browser_frames";
 const TOOL_FRAME_INSPECT: &str = "agent_browser_frame_inspect";
 const TOOL_TARGETS: &str = "agent_browser_targets";
+const TOOL_TARGET_EVAL: &str = "agent_browser_target_eval";
 const TOOL_CONTEXT_NEW: &str = "agent_browser_context_new";
 const TOOL_CONTEXT_LIST: &str = "agent_browser_context_list";
 const TOOL_CONTEXT_CLOSE: &str = "agent_browser_context_close";
@@ -277,7 +278,7 @@ impl ToolProfile {
             Self::Network => "Network interception, request inspection, HAR capture, headers, credentials, and offline mode.",
             Self::State => "Cookies, storage, auth profiles, saved browser state, sessions, Chrome profiles, and bundled skills.",
             Self::Debug => "Console/errors, highlighting, DevTools, tracing, profiling, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
-            Self::Tabs => "Tab, window, frame, and JavaScript dialog management.",
+            Self::Tabs => "Tab, window, frame, CDP target, and JavaScript dialog management.",
             Self::React => "React tree inspection, render recording, Suspense inspection, Web Vitals, SPA pushstate, and init-script removal.",
             Self::Mobile => "Viewport/device/geolocation/media emulation plus touch, swipe, and lower-level mouse tools.",
             Self::All => "Every MCP tool, including the full typed CLI parity surface.",
@@ -493,6 +494,7 @@ const TABS_PROFILE_TOOLS: &[&str] = &[
     TOOL_FRAMES,
     TOOL_FRAME_INSPECT,
     TOOL_TARGETS,
+    TOOL_TARGET_EVAL,
     TOOL_CONTEXT_NEW,
     TOOL_CONTEXT_LIST,
     TOOL_CONTEXT_CLOSE,
@@ -1206,7 +1208,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_NETWORK_REQUEST,
             "Network request detail",
-            "Show one request by id and optionally write a private CDP reconstruction.",
+            "Show one request by id and optionally write a reconstructed raw HTTP request.",
             json!({ "requestId": { "type": "string" }, "rawOut": { "type": "string" } }),
             &["requestId"],
         ),
@@ -1342,6 +1344,10 @@ fn parity_tools() -> Vec<Value> {
         tool(TOOL_FRAMES, "Frame graph", "Return stable frame IDs, origins, hierarchy, OOPIF sessions, and iframe policy.", json!({}), &[]),
         tool(TOOL_FRAME_INSPECT, "Frame inspect", "Inspect one frame by stable CDP frame ID.", json!({ "frameId": { "type": "string" } }), &["frameId"]),
         tool(TOOL_TARGETS, "Target graph", "Return pages, workers, popup openers, and browser contexts.", json!({}), &[]),
+        tool(TOOL_TARGET_EVAL, "Target eval", "Evaluate JavaScript in an eligible non-page CDP target in the active browser context without switching tabs.", json!({
+            "targetId": { "type": "string", "description": "Stable CDP target ID from agent_browser_targets." },
+            "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
+        }), &["targetId", "script"]),
         tool(TOOL_CONTEXT_NEW, "Context new", "Create an isolated browser context, optionally seeded from saved state.", json!({
             "url": { "type": "string" },
             "statePath": { "type": "string" },
@@ -2320,6 +2326,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_FRAMES => call_literal(arguments, &["frames", "tree"]),
         TOOL_FRAME_INSPECT => call_one_string(arguments, "frame inspect", "frameId"),
         TOOL_TARGETS => call_literal(arguments, &["targets", "tree"]),
+        TOOL_TARGET_EVAL => call_target_eval(arguments),
         TOOL_CONTEXT_NEW => call_context_new(arguments),
         TOOL_CONTEXT_LIST => call_literal(arguments, &["context", "list"]),
         TOOL_CONTEXT_CLOSE => call_one_string(arguments, "context close", "contextId"),
@@ -3723,6 +3730,25 @@ fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, Some(script))
 }
 
+fn target_eval_args(arguments: &Value) -> Result<(Vec<String>, String), ProtocolError> {
+    let target_id = required_string(arguments, "targetId")?;
+    let script = required_string(arguments, "script")?;
+    Ok((
+        vec![
+            "target".to_string(),
+            "eval".to_string(),
+            target_id,
+            "--stdin".to_string(),
+        ],
+        script,
+    ))
+}
+
+fn call_target_eval(arguments: &Value) -> Result<Value, ProtocolError> {
+    let (args, script) = target_eval_args(arguments)?;
+    call_cli_tool(arguments, args, Some(script))
+}
+
 fn call_close(arguments: &Value) -> Result<Value, ProtocolError> {
     let mut args = vec!["close".to_string()];
     if optional_bool(arguments, "all")?.unwrap_or(false) {
@@ -4228,6 +4254,7 @@ mod tests {
         assert!(names.contains(&TOOL_SCREENSHOT));
         assert!(names.contains(&TOOL_GET_CDP_URL));
         assert!(names.contains(&TOOL_NETWORK_HAR_START));
+        assert!(names.contains(&TOOL_TARGET_EVAL));
         assert!(names.contains(&TOOL_REACT_SUSPENSE));
         assert!(names.contains(&TOOL_SKILLS_GET));
         assert!(names.contains(&TOOL_PLUGIN_ADD));
@@ -4379,6 +4406,26 @@ mod tests {
         assert!(names.contains(&TOOL_REACT_TREE));
         assert!(names.contains(&TOOL_VITALS));
         assert!(!names.contains(&TOOL_NETWORK_HAR_START));
+    }
+
+    #[test]
+    fn tabs_profile_exposes_target_eval() {
+        let config = McpConfig::from_profiles(vec![ToolProfile::Tabs]);
+        assert!(config.allows(TOOL_TARGETS));
+        assert!(config.allows(TOOL_TARGET_EVAL));
+        assert!(!config.allows(TOOL_EVAL));
+    }
+
+    #[test]
+    fn target_eval_uses_cli_parser_and_stdin() {
+        let (args, stdin) = target_eval_args(&json!({
+            "targetId": "WORKER_TARGET",
+            "script": "self.registration.scope"
+        }))
+        .unwrap();
+
+        assert_eq!(args, vec!["target", "eval", "WORKER_TARGET", "--stdin"]);
+        assert_eq!(stdin, "self.registration.scope");
     }
 
     #[test]

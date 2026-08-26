@@ -37,6 +37,7 @@ agent-browser network requests --type xhr,fetch
 agent-browser network requests --method POST
 agent-browser network requests --status 2xx
 agent-browser network request <requestId>
+agent-browser network request <requestId> --raw-out ./request.http
 agent-browser network requests --clear
 ```
 
@@ -53,7 +54,7 @@ agent-browser network requests --clear
   </tbody>
 </table>
 
-Use `network request <requestId>` to inspect one request and response in detail after finding its ID in `network requests`.
+Use `network request <requestId>` to inspect one request and response in detail after finding its ID in `network requests`. Add `--raw-out <path>` to write a reconstructed raw HTTP request without printing it. The output is suitable for raw-request consumers or manual translation to curl; it is not a curl command. The command refuses to overwrite an existing file and creates it with mode `0600` on Unix. CDP exposes decoded request metadata rather than original wire bytes, so use a proxy history export when byte-for-byte evidence matters.
 
 ## HAR export
 

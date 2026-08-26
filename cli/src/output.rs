@@ -2482,6 +2482,8 @@ Subcommands:
     --method <method>        Filter by HTTP method (GET, POST, etc.)
     --status <code>          Filter by status (200, 2xx, 400-499)
   request <requestId>        View full request/response detail (including body)
+    --raw-out <path>         Write a non-overwriting reconstructed raw HTTP request
+                             Output files use mode 0600 on Unix
   har <start|stop> [path]    Record and export a HAR file
     --content <mode>         Response bodies to embed on start: text (default), all, none
 
@@ -2499,6 +2501,7 @@ Examples:
   agent-browser network requests --method POST --status 2xx
   agent-browser network requests --clear
   agent-browser network request 1234.5
+  agent-browser network request 1234.5 --raw-out ./request.http
   agent-browser network har start
   agent-browser network har start --content all
   agent-browser network har stop ./capture.har
@@ -2705,6 +2708,33 @@ agent-browser targets - Inspect the browser target graph
 Usage: agent-browser targets [tree|list]
 
 Returns pages, workers, popups, opener relationships, and browser context IDs.
+"##
+        }
+
+        "target" => {
+            r##"
+agent-browser target - Operate on a specific CDP target
+
+Usage: agent-browser target eval <target-id> [options] <script>
+
+Evaluates JavaScript in a target returned by `targets tree`, such as a service
+worker or Chrome extension background target, without switching tabs.
+Only non-page execution targets in the active browser context are eligible.
+Shared CDP default contexts and contexts containing a target owned by another
+session or worker are refused.
+
+Options:
+  -b, --base64         Decode script from base64
+  --stdin              Read script from stdin
+
+Global Options:
+  --json               Output as JSON
+  --session <name>     Use specific session
+
+Examples:
+  agent-browser targets tree
+  agent-browser target eval <target-id> "self.location.href"
+  echo "self.registration.scope" | agent-browser target eval <target-id> --stdin
 "##
         }
 
@@ -3610,7 +3640,7 @@ Tool profiles:
   debug      Console/errors, tracing, profiling, recording, accessibility audits,
              clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff,
              batch, confirm/deny
-  tabs       Back/forward/reload, tabs, windows, frames, dialogs
+  tabs       Back/forward/reload, tabs, windows, frames, targets, dialogs
   react      React tree/inspect/renders/suspense, vitals, pushstate
   mobile     Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
   all        Every MCP tool, including the full typed CLI parity surface
@@ -3811,6 +3841,7 @@ Core Commands:
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
   frames [tree|list]         Inspect frame IDs, origins, and iframe policy
+  target eval <id> <js>      Run JavaScript in an eligible non-page CDP target
   targets [tree|list]        Inspect pages, popups, workers, and contexts
   postmessage <action>       Monitor or send cross-window messages
   evidence <action>          Capture a redacted, hashed evidence bundle
@@ -3868,6 +3899,7 @@ Debug:
 Security Workflow:
   frames tree                Inspect stable frame IDs and trust boundaries
   targets tree               Inspect page, popup, opener, and context relationships
+  target eval <id> <js>      Inspect service workers or background targets
   profiler start|stop [path] Record Chrome DevTools profile
   record start <path> [url]  Start video recording (WebM)
   record stop                Stop and save video
