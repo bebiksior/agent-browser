@@ -37,6 +37,7 @@ fn native_test_fixture_html(name: &str) -> &'static str {
         "drag_probe" => include_str!("test_fixtures/drag_probe.html"),
         "html5_drag_probe" => include_str!("test_fixtures/html5_drag_probe.html"),
         "pointer_capture_probe" => include_str!("test_fixtures/pointer_capture_probe.html"),
+        "snapshot_diff_probe" => include_str!("test_fixtures/snapshot_diff_probe.html"),
         "upload_probe" => include_str!("test_fixtures/upload_probe.html"),
         _ => panic!("Unknown native test fixture: {}", name),
     }
@@ -3364,7 +3365,11 @@ async fn e2e_diff_snapshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<h1>Hello</h1><p>World</p>" }),
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": native_test_fixture_url("snapshot_diff_probe")
+        }),
         &mut state,
     )
     .await;
@@ -3374,10 +3379,57 @@ async fn e2e_diff_snapshot() {
     let resp = execute_command(&json!({ "id": "3", "action": "snapshot" }), &mut state).await;
     assert_success(&resp);
     let baseline = get_data(&resp)["snapshot"].as_str().unwrap().to_string();
+    assert!(baseline.starts_with("- button \"Primary action\" [ref=e1]"));
+    let baseline_dir = tempfile::tempdir().unwrap();
+    let baseline_path = baseline_dir.path().join("baseline.txt");
+    std::fs::write(&baseline_path, format!("{}\n", baseline)).unwrap();
+
+    // A failed diff must preserve the refs from the last successful snapshot.
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "diff_snapshot",
+            "baseline": baseline_path,
+            "selector": "#missing"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"]
+        .as_str()
+        .unwrap()
+        .contains("did not match any element"));
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "click", "selector": "e1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Repeated diffs must each begin a fresh ref-numbering epoch.
+    for id in ["6", "7"] {
+        let resp = execute_command(
+            &json!({ "id": id, "action": "diff_snapshot", "baseline": baseline_path }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let data = get_data(&resp);
+        assert_eq!(data["changed"], false);
+        assert_eq!(data["additions"], 0);
+        assert_eq!(data["removals"], 0);
+        assert_eq!(data["diff"], "");
+    }
 
     // Modify the page
     let resp = execute_command(
-        &json!({ "id": "4", "action": "evaluate", "script": "document.querySelector('h1').textContent = 'Changed'" }),
+        &json!({
+            "id": "8",
+            "action": "evaluate",
+            "script": "document.querySelector('#primary-action').textContent = 'Updated action'"
+        }),
         &mut state,
     )
     .await;
@@ -3385,13 +3437,116 @@ async fn e2e_diff_snapshot() {
 
     // Diff against baseline
     let resp = execute_command(
-        &json!({ "id": "5", "action": "diff_snapshot", "baseline": baseline }),
+        &json!({ "id": "9", "action": "diff_snapshot", "baseline": baseline_path }),
         &mut state,
     )
     .await;
     assert_success(&resp);
     let data = get_data(&resp);
-    assert_eq!(data["changed"], true, "Diff should detect the h1 change");
+    assert_eq!(
+        data["changed"], true,
+        "Diff should detect the button change"
+    );
+    assert_eq!(data["additions"], 1);
+    assert_eq!(data["removals"], 1);
+    assert!(data["diff"].as_str().unwrap().contains("Updated action"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_diff_url_aligns_refs_after_snapshot() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let stale_url = "data:text/html,<button id='stale-action'>Stale action</button>";
+    let url = native_test_fixture_url("snapshot_diff_probe");
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": stale_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Populate refs that must be invalidated once the URL diff starts navigating.
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "snapshot",
+            "selector": "#stale-action"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.ref_map.get("e1").is_some());
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "diff_url",
+            "url1": url,
+            "url2": "http://[invalid"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(state.ref_map.entries_sorted().is_empty());
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.querySelector('#primary-action')?.textContent"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "Primary action");
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "click", "selector": "e1" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"].as_str().unwrap().contains("Unknown ref: e1"));
+
+    // Populate the session ref map before comparing the same URL to itself.
+    let resp = execute_command(&json!({ "id": "7", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "8",
+            "action": "diff_url",
+            "url1": url,
+            "url2": url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["diff"]["identical"], true);
+    assert_eq!(data["diff"]["changed"], false);
+    assert_eq!(data["diff"]["additions"], 0);
+    assert_eq!(data["diff"]["removals"], 0);
+    assert_eq!(data["snapshot1"], data["snapshot2"]);
+    assert!(data["snapshot1"]
+        .as_str()
+        .unwrap()
+        .starts_with("- button \"Primary action\" [ref=e1]"));
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -5411,6 +5566,813 @@ async fn e2e_relaunch_on_options_change() {
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
+// Stream: URL events follow active main-frame navigation
+// ---------------------------------------------------------------------------
+
+async fn start_stream_navigation_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stream navigation server should bind");
+    let port = listener
+        .local_addr()
+        .expect("stream navigation server should have an address")
+        .port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let Ok(size) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request_target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let path = request_target.split('?').next().unwrap_or("/");
+                if let Some(destination) = path.strip_prefix("/redirect/") {
+                    let location = format!("/landed/{destination}");
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let body = match path {
+                    "/child" => {
+                        "<!doctype html><title>child</title><p id=\"child\">child</p>"
+                    }
+                    _ => {
+                        "<!doctype html><title>main</title><a id=\"anchor\" href=\"#section\">anchor</a><div id=\"section\">section</div><iframe id=\"child\" src=\"/child\"></iframe>"
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+async fn next_stream_url(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> String {
+    loop {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("stream should emit a URL message")
+            .expect("stream should stay open")
+            .expect("stream message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("message should be text"))
+                .expect("stream payload should be JSON");
+        if payload["type"] == "url" {
+            return payload["url"]
+                .as_str()
+                .expect("URL message should carry a URL")
+                .to_string();
+        }
+    }
+}
+
+async fn expect_no_stream_url(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    duration: tokio::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = tokio::time::timeout(remaining, ws.next()).await;
+        let Ok(Some(Ok(message))) = result else {
+            return;
+        };
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("message should be text"))
+                .expect("stream payload should be JSON");
+        assert_ne!(
+            payload["type"], "url",
+            "unexpected background or child URL: {payload}"
+        );
+    }
+}
+
+async fn next_collected_stream_message(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    iteration: usize,
+    phase: &str,
+) -> Value {
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap_or_else(|_| panic!("stress iteration {iteration} timed out during {phase}"))
+        .unwrap_or_else(|| {
+            panic!("stress iteration {iteration} stream collector stopped during {phase}")
+        })
+}
+
+async fn wait_for_active_stream_tab(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    tab_id: &str,
+    iteration: usize,
+) {
+    loop {
+        let payload =
+            next_collected_stream_message(messages, iteration, "active-tab stream rebind").await;
+        if payload["type"] != "tabs" {
+            continue;
+        }
+        let is_active = payload["tabs"].as_array().is_some_and(|tabs| {
+            tabs.iter()
+                .any(|tab| tab["tabId"] == tab_id && tab["active"].as_bool() == Some(true))
+        });
+        if is_active {
+            return;
+        }
+    }
+}
+
+async fn wait_for_stress_stream_url(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    expected_url: &str,
+    forbidden_marker: &str,
+    iteration: usize,
+) {
+    loop {
+        let payload =
+            next_collected_stream_message(messages, iteration, "active URL convergence").await;
+        if payload["type"] != "url" {
+            continue;
+        }
+        let url = payload["url"]
+            .as_str()
+            .expect("stress URL payload should contain a URL");
+        assert!(
+            !url.contains(forbidden_marker),
+            "stress iteration {iteration} attributed the previous tab URL to the new active tab: {payload}"
+        );
+        if url == expected_url {
+            return;
+        }
+    }
+}
+
+async fn expect_no_forbidden_stream_url(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    forbidden_marker: &str,
+    iteration: usize,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(100);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(payload)) = tokio::time::timeout(remaining, messages.recv()).await else {
+            return;
+        };
+        if payload["type"] != "url" {
+            continue;
+        }
+        let url = payload["url"]
+            .as_str()
+            .expect("stress URL payload should contain a URL");
+        assert!(
+            !url.contains(forbidden_marker),
+            "stress iteration {iteration} emitted a forbidden URL after convergence: {payload}"
+        );
+    }
+}
+
+async fn seeded_stream_tabs(port: u64, iteration: usize) -> Vec<Value> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("stress probe should connect to runtime stream");
+    loop {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("stress iteration {iteration} probe timed out waiting for tabs")
+            })
+            .expect("stress probe stream should stay open")
+            .expect("stress probe message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("probe message should be text"))
+                .expect("probe stream payload should be JSON");
+        if payload["type"] == "tabs" {
+            return payload["tabs"]
+                .as_array()
+                .expect("probe tabs payload should be an array")
+                .clone();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_url_tracks_active_main_frame_navigation_categories() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-url-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-url");
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{base_url}/") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("websocket client should connect to runtime stream");
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await;
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "evaluate",
+            "script": "history.pushState({}, '', '/spa'); location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, format!("{base_url}/spa"));
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "evaluate",
+            "script": "location.hash = 'section'; location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/spa#section")
+    );
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.querySelector('#child').contentWindow.history.pushState({}, '', '/child-spa'); 'done'"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "navigate", "url": format!("{base_url}/full") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, format!("{base_url}/full"));
+
+    let resp = execute_command(
+        &json!({
+            "id": "7",
+            "action": "tab_new",
+            "url": format!("{base_url}/")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let background_session = state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .pages_list()
+        .into_iter()
+        .find(|page| page.tab_id == 2)
+        .expect("background tab should exist")
+        .session_id;
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    while tokio::time::timeout(tokio::time::Duration::from_millis(100), ws.next())
+        .await
+        .is_ok()
+    {}
+
+    let resp = execute_command(
+        &json!({
+            "id": "9",
+            "action": "evaluate",
+            "script": "history.pushState({}, '', '/after-switch'); location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/after-switch")
+    );
+
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Page.navigate",
+            Some(json!({ "url": format!("{base_url}/background-full") })),
+            Some(&background_session),
+        )
+        .await
+        .expect("background tab should navigate");
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": format!("{base_url}/external") })),
+            None,
+        )
+        .await
+        .expect("external tab should open");
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let resp = execute_command(&json!({ "id": "10", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["url"], format!("{base_url}/external"));
+
+    let external_session = state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .active_session_id()
+        .expect("external tab should become active")
+        .to_string();
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": "history.pushState({}, '', '/external-spa'); location.href"
+            })),
+            Some(&external_session),
+        )
+        .await
+        .expect("external tab should navigate within its document");
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/external-spa")
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_lightpanda_stream_url_tracks_active_full_navigation() {
+    let lightpanda_bin = match std::env::var("LIGHTPANDA_BIN") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return,
+    };
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-lightpanda-stream-url-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-lightpanda-stream-url");
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "lp-stream", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = tokio::time::timeout(
+        tokio::time::Duration::from_secs(20),
+        execute_command(
+            &json!({
+                "id": "lp-launch",
+                "action": "launch",
+                "headless": true,
+                "engine": "lightpanda",
+                "executablePath": lightpanda_bin
+            }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("Lightpanda stream launch should not hang");
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "lp-initial",
+            "action": "navigate",
+            "url": format!("{base_url}/lp-initial")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("Lightpanda stream client should connect");
+    while tokio::time::timeout(tokio::time::Duration::from_millis(100), ws.next())
+        .await
+        .is_ok()
+    {}
+
+    let active_before_background = format!("{base_url}/lp-active-before-background");
+    let resp = execute_command(
+        &json!({
+            "id": "lp-active-before",
+            "action": "navigate",
+            "url": active_before_background
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, active_before_background);
+
+    let resp = execute_command(
+        &json!({
+            "id": "lp-child-navigation",
+            "action": "evaluate",
+            "script": "document.querySelector('#child').src = '/lp-forbidden-child'; 'done'"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    let tabs = seeded_stream_tabs(port, 0).await;
+    let active = tabs
+        .iter()
+        .find(|tab| tab["active"].as_bool() == Some(true))
+        .expect("Lightpanda reconnect should seed an active tab");
+    assert_eq!(active["tabId"], "t1");
+    assert_eq!(active["url"], active_before_background);
+
+    let final_url = format!("{base_url}/lp-active-final");
+    let resp = execute_command(
+        &json!({
+            "id": "lp-active-final",
+            "action": "navigate",
+            "url": final_url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, final_url);
+
+    let resp = execute_command(&json!({ "id": "lp-close", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_url_survives_real_world_navigation_stress() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-url-stress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-url-stress");
+
+    let iterations = std::env::var("AGENT_BROWSER_STRESS_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40);
+    let mut seed = std::env::var("AGENT_BROWSER_STRESS_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1677);
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "stress-stream", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = execute_command(
+        &json!({
+            "id": "stress-tab-a",
+            "action": "navigate",
+            "url": format!("{base_url}/app-a")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "stress-tab-b",
+            "action": "tab_new",
+            "url": format!("{base_url}/app-b")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let pages = state
+        .browser
+        .as_ref()
+        .expect("stress browser should exist")
+        .pages_list();
+    let session_a = pages
+        .iter()
+        .find(|page| page.tab_id == 1)
+        .expect("stress tab A should exist")
+        .session_id
+        .clone();
+    let session_b = pages
+        .iter()
+        .find(|page| page.tab_id == 2)
+        .expect("stress tab B should exist")
+        .session_id
+        .clone();
+    let client = Arc::clone(
+        &state
+            .browser
+            .as_ref()
+            .expect("stress browser should exist")
+            .client,
+    );
+
+    let (fast_ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("stress collector should connect to runtime stream");
+    let (message_tx, mut messages) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let collector = tokio::spawn(async move {
+        let mut ws = fast_ws;
+        while let Some(Ok(message)) = ws.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(
+                message.to_text().expect("collector message should be text"),
+            ) else {
+                continue;
+            };
+            if message_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    wait_for_active_stream_tab(&mut messages, "t2", 0).await;
+
+    let (mut slow_ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("slow stress client should connect to runtime stream");
+
+    let mut active_tab = "t2";
+    for iteration in 0..iterations {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let delay_ms = 1 + (seed % 12);
+        let target_tab = if active_tab == "t1" { "t2" } else { "t1" };
+        let old_session = if active_tab == "t1" {
+            session_a.clone()
+        } else {
+            session_b.clone()
+        };
+        let forbidden_marker = format!("forbidden-{iteration}");
+        let same_document_path = format!("/{forbidden_marker}-old-spa");
+        let redirect_url = format!("{base_url}/redirect/{forbidden_marker}-old-full");
+
+        let late_client = Arc::clone(&client);
+        let late_session = old_session.clone();
+        let late_same_document_path = same_document_path.clone();
+        let late_child_marker = forbidden_marker.clone();
+        let late_same_document = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            let expression = format!(
+                "history.pushState({{}}, '', {}); const child = document.querySelector('#child'); if (child?.contentWindow) child.contentWindow.history.pushState({{}}, '', '/{late_child_marker}-old-child'); location.href",
+                serde_json::to_string(&late_same_document_path)
+                    .expect("stress path should serialize")
+            );
+            late_client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({ "expression": expression })),
+                    Some(&late_session),
+                )
+                .await
+        });
+
+        let redirect_client = Arc::clone(&client);
+        let redirect_session = old_session.clone();
+        let late_redirect = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms + 1)).await;
+            redirect_client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({ "url": redirect_url })),
+                    Some(&redirect_session),
+                )
+                .await
+        });
+
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-switch-{iteration}"),
+                "action": "tab_switch",
+                "tabId": target_tab
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        wait_for_active_stream_tab(&mut messages, target_tab, iteration).await;
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), late_same_document)
+            .await
+            .unwrap_or_else(|_| panic!("stress iteration {iteration} late SPA task timed out"))
+            .expect("late SPA task should join")
+            .expect("late SPA CDP command should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), late_redirect)
+            .await
+            .unwrap_or_else(|_| panic!("stress iteration {iteration} late redirect task timed out"))
+            .expect("late redirect task should join")
+            .expect("late redirect CDP command should succeed");
+
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-child-{iteration}"),
+                "action": "evaluate",
+                "script": format!(
+                    "const child = document.querySelector('#child'); if (!child?.contentWindow) throw new Error('missing stress iframe'); child.contentWindow.history.pushState({{}}, '', '/{forbidden_marker}-active-child'); 'done'"
+                )
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let expected_url = format!("{base_url}/{target_tab}-active-{iteration}");
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-active-{iteration}"),
+                "action": "evaluate",
+                "script": format!(
+                    "history.replaceState({{}}, '', {}); location.href",
+                    serde_json::to_string(&expected_url).expect("stress URL should serialize")
+                )
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        wait_for_stress_stream_url(&mut messages, &expected_url, &forbidden_marker, iteration)
+            .await;
+
+        let resp = execute_command(
+            &json!({ "id": format!("stress-url-{iteration}"), "action": "url" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(
+            get_data(&resp)["url"],
+            expected_url,
+            "stress iteration {iteration} active browser URL diverged"
+        );
+        expect_no_forbidden_stream_url(&mut messages, &forbidden_marker, iteration).await;
+
+        if iteration % 5 == 0 {
+            let tabs = seeded_stream_tabs(port, iteration).await;
+            let active = tabs
+                .iter()
+                .find(|tab| tab["active"].as_bool() == Some(true))
+                .unwrap_or_else(|| {
+                    panic!("stress iteration {iteration} reconnect had no active tab")
+                });
+            assert_eq!(
+                active["tabId"], target_tab,
+                "stress iteration {iteration} reconnect seeded the wrong active tab"
+            );
+            assert_eq!(
+                active["url"], expected_url,
+                "stress iteration {iteration} reconnect seeded a stale URL"
+            );
+        }
+
+        if iteration % 7 == 6 {
+            drop(slow_ws);
+            let (replacement, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+                    .await
+                    .expect("replacement slow stress client should connect");
+            slow_ws = replacement;
+        }
+
+        active_tab = target_tab;
+    }
+
+    drop(slow_ws);
+    collector.abort();
+    let resp = execute_command(
+        &json!({ "id": "stress-close", "action": "close" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
 }
 
 // ---------------------------------------------------------------------------

@@ -67,6 +67,7 @@ This design solves the version drift problem: the installed SKILL.md rarely chan
 - **electron** — Automate any Electron app (VS Code, Slack, Discord, Figma, etc.) by connecting to its built-in Chrome DevTools Protocol port.
 - **slack** — Browser-based Slack automation. Check unreads, navigate channels, search conversations, send messages, and extract data.
 - **vercel-sandbox** — Run agent-browser + headless Chrome inside ephemeral Vercel Sandbox microVMs.
+- **protected-vercel-deployments** — Access and test Vercel deployments behind Vercel Authentication, SSO, or Deployment Protection with short-lived Trusted Sources OIDC tokens.
 - **agentcore** — Run agent-browser on AWS Bedrock AgentCore cloud browsers.
 
 Use `agent-browser skills list` to see all available skills, then `agent-browser skills get <name>` to load one. `agent-browser skills get core --full` is the recommended starting point for most browser tasks.

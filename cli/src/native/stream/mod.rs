@@ -245,12 +245,6 @@ impl StreamServer {
         self.client_notify.notify_one();
     }
 
-    /// Update the active CDP page session ID used for screencast commands.
-    pub async fn set_cdp_session_id(&self, session_id: Option<String>) {
-        let mut guard = self.cdp_session_id.write().await;
-        *guard = session_id;
-    }
-
     /// Check whether the server currently has active screencast running.
     pub async fn is_screencasting(&self) -> bool {
         *self.screencasting.lock().await
@@ -585,6 +579,26 @@ impl StreamServer {
             "timestamp": timestamp_ms(),
         });
         let _ = self.frame_tx.send(msg.to_string());
+    }
+
+    pub async fn bind_cdp_session_and_broadcast_tabs(
+        &self,
+        session_id: Option<String>,
+        tabs: &[Value],
+    ) {
+        let mut session_guard = self.cdp_session_id.write().await;
+        let mut tabs_guard = self.last_tabs.write().await;
+        *session_guard = session_id;
+        *tabs_guard = tabs.to_vec();
+        let msg = json!({
+            "type": "tabs",
+            "tabs": tabs,
+            "timestamp": timestamp_ms(),
+        });
+        let _ = self.frame_tx.send(msg.to_string());
+        drop(tabs_guard);
+        drop(session_guard);
+        self.client_notify.notify_one();
     }
 }
 

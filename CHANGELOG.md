@@ -1,8 +1,45 @@
 # agent-browser
 
-## 0.34.0
+## 0.35.1
 
 <!-- release:start -->
+### Bug Fixes
+
+- Fixed **Windows ARM64 launcher selection** to prefer a native ARM64 executable when present and fall back to the published x64 executable through Windows emulation when it is not (#1725)
+- Fixed **stream URL tracking** to emit active main-frame URL updates for full-document, History API, and fragment navigation, while rebinding correctly after active-tab changes and ignoring child-frame or background-tab navigation (#1682)
+- Fixed **snapshot diff element references** by resetting ref numbering for each diff, invalidating refs across URL navigations, and preserving the previous refs when a diff fails (#1719)
+
+### Improvements
+
+- Updated **Rust dependencies** to `rustls-webpki` 0.103.13 and `quinn-proto` 0.11.17 (#1723, #1720)
+
+### Contributors
+
+- @ctate
+- @Railly
+- @Angelmmiguel
+- @anupamme
+- @nexxusbruno-ship-it
+<!-- release:end -->
+
+## 0.35.0
+
+### New Features
+
+- Added **private proxy CA trust for locally launched Chromium on Linux**. Use `--ca-cert <path>`, `AGENT_BROWSER_CA_CERT`, or `caCert` in config and MCP to import a PEM bundle or DER certificate into an isolated NSS trust store without disabling hostname, validity, or unrelated-authority verification. The effective CA persists across commands in a running session, equivalent certificate content reuses Chromium, and `--no-ca-cert` explicitly clears retained trust. Unsupported launch modes and conflicting CA options return actionable errors (#1669)
+
+### Improvements
+
+- Added a bundled **protected Vercel deployments skill** that guides agents through short-lived Trusted Sources OIDC authentication, authorized automation bypasses, and explicit human handoffs for dashboard-only configuration (#1705)
+
+### Contributors
+
+- @Railly
+- @ctate
+- @bilby91
+
+## 0.34.0
+
 ### New Features
 
 - Added **persistent session-to-tab binding for shared Chrome sessions**. Named sessions connected through `--cdp` or `--auto-connect` now remember their CDP target across commands and daemon restarts, and CDP target ids can be used directly as tab references. Start each session with `--pin-tab` to make the binding strict, so a tab closed externally returns a stable `tab_gone` error instead of silently adopting a neighboring tab. JSON output includes `data.targetId` and an optional sanitized `data.lastUrl`; batch exposes the same recovery data under `result` (#1589)
@@ -23,7 +60,6 @@
 - @soichisumi
 - @dandaka
 - @mvanhorn
-<!-- release:end -->
 
 ## 0.33.2
 

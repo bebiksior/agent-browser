@@ -858,18 +858,21 @@ mod tests {
             .spawn()
             .expect("failed to spawn child");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                assert!(
-                    !status.success(),
-                    "child exited with code 42, should not be success"
-                );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not exit before the deadline");
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => panic!("try_wait() should succeed without waitpid(-1): {}", e),
             }
-            Ok(None) => panic!("try_wait() returned None but child should have exited"),
-            Err(e) => panic!("try_wait() should succeed without waitpid(-1): {}", e),
-        }
+        };
+
+        assert_eq!(status.code(), Some(42));
     }
 
     /// Regression test for #1101: idle timeout must fire even while the

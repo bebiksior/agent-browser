@@ -1107,22 +1107,21 @@ impl DaemonState {
                 .browser
                 .as_ref()
                 .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
-            server.set_cdp_session_id(session_id).await;
-
-            // Broadcast connection status change to WebSocket clients
             let connected = self.browser.is_some();
             let sc = server.is_screencasting().await;
             let (vw, vh) = server.viewport().await;
+            if let Some(ref mgr) = self.browser {
+                server
+                    .bind_cdp_session_and_broadcast_tabs(session_id, &mgr.tab_list())
+                    .await;
+            } else {
+                server
+                    .bind_cdp_session_and_broadcast_tabs(session_id, &[])
+                    .await;
+            }
             server
                 .broadcast_status(connected, sc, vw, vh, &self.engine)
                 .await;
-            if let Some(ref mgr) = self.browser {
-                server.broadcast_tabs(&mgr.tab_list()).await;
-            } else {
-                server.broadcast_tabs(&[]).await;
-            }
-            // Notify the background CDP event loop that the client changed
-            server.notify_client_changed();
         }
     }
 
@@ -3395,18 +3394,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         server.broadcast_result(&id, action, success, &data, duration_ms);
 
         if let Some(ref mgr) = state.browser {
-            server.broadcast_tabs(&mgr.tab_list()).await;
-
-            // Keep the stream server's CDP session in sync with the active tab
-            // so screencasting always targets the correct page.
-            if matches!(
-                action,
-                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
-            ) {
-                let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
-                server.set_cdp_session_id(session_id).await;
-                server.notify_client_changed();
-            }
+            let tabs = mgr.tab_list();
+            let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
+            server
+                .bind_cdp_session_and_broadcast_tabs(session_id, &tabs)
+                .await;
         }
     }
 
@@ -7474,11 +7466,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         selector,
         ..SnapshotOptions::default()
     };
+    // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
+    // Build the replacement separately so a failed diff leaves the existing refs usable.
+    let mut current_ref_map = RefMap::new();
     let current = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut current_ref_map,
         state.active_frame_id.as_deref(),
         &state.iframe_sessions,
     )
@@ -7488,13 +7483,23 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
 
     let baseline_text = match baseline {
         Some(b) if std::path::Path::new(b).exists() => {
-            std::fs::read_to_string(b).map_err(|e| format!("Failed to read baseline: {}", e))?
+            let mut contents = std::fs::read_to_string(b)
+                .map_err(|e| format!("Failed to read baseline: {}", e))?;
+            // Plain CLI output ends with one newline when redirected to a baseline file.
+            if contents.ends_with('\n') {
+                contents.pop();
+                if contents.ends_with('\r') {
+                    contents.pop();
+                }
+            }
+            contents
         }
         Some(b) => b.to_string(),
         None => String::new(),
     };
 
     let result = diff::diff_snapshots(&baseline_text, &current);
+    state.ref_map = current_ref_map;
     Ok(json!({
         "diff": result.diff,
         "additions": result.additions,
@@ -7522,34 +7527,40 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .map(WaitUntil::from_str)
         .unwrap_or(WaitUntil::Load);
 
+    // Each navigation can replace the document, so invalidate refs before it starts.
+    state.ref_map.clear();
+
     // Navigate to URL1 and snapshot
     mgr.navigate(url1, wait_until).await?;
     let session_id = mgr.active_session_id()?.to_string();
     let options = SnapshotOptions::default();
+    let mut snap1_ref_map = RefMap::new();
     let snap1 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut snap1_ref_map,
         None,
         &state.iframe_sessions,
     )
     .await?;
 
     // Navigate to URL2 and snapshot
-    mgr.navigate(url2, wait_until).await?;
     state.ref_map.clear();
+    mgr.navigate(url2, wait_until).await?;
+    let mut snap2_ref_map = RefMap::new();
     let snap2 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut snap2_ref_map,
         None,
         &state.iframe_sessions,
     )
     .await?;
 
     let result = diff::diff_text(&snap1, &snap2);
+    state.ref_map = snap2_ref_map;
     Ok(json!({
         "diff": result,
         "url1": url1,

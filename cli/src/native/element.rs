@@ -1377,6 +1377,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ref_map_clear_resets_ref_numbering() {
+        let mut map = RefMap::new();
+        map.add("e1".to_string(), Some(42), "button", "Submit", None);
+        map.set_next_ref_num(2);
+
+        map.clear();
+
+        assert!(map.get("e1").is_none());
+        assert_eq!(map.next_ref_num(), 1);
+    }
+
+    #[test]
     fn test_build_selector_js_css() {
         let js = build_selector_js("#submit-btn");
         assert!(js.contains("document.querySelector(\"#submit-btn\")"));
