@@ -501,6 +501,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--use-mock-keychain".to_string());
     }
 
+    // Allow software WebGL fallback in both modes. Headed Chrome under Xvfb
+    // can lack a GPU too; this opt-in keeps WebGL available without forcing
+    // software rendering on machines with a supported hardware backend.
+    args.push("--enable-unsafe-swiftshader".to_string());
+
     let effectively_headless = options.effectively_headless();
 
     // Extensions require headed mode in native Chrome (content scripts are not
@@ -514,11 +519,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         if options.hide_scrollbars {
             args.push("--hide-scrollbars".to_string());
         }
-        // Enable SwiftShader software rendering in headless mode.  This
-        // prevents silent crashes in environments where GPU drivers are
-        // missing or restricted (VMs, containers, some cloud machines)
-        // while preserving WebGL support.  Playwright uses the same flag.
-        args.push("--enable-unsafe-swiftshader".to_string());
     }
 
     if let Some(ref proxy) = options.proxy {
@@ -1973,7 +1973,7 @@ mod tests {
         let result = build_chrome_args(&opts).unwrap();
         assert!(!result.args.iter().any(|a| a.contains("--headless")));
         assert!(!result.args.iter().any(|a| a == "--hide-scrollbars"));
-        assert!(!result
+        assert!(result
             .args
             .iter()
             .any(|a| a == "--enable-unsafe-swiftshader"));

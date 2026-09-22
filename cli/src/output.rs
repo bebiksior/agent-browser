@@ -3493,7 +3493,7 @@ Usage: agent-browser doctor [options]
 
 Runs a battery of checks across environment, Chrome install, daemon state,
 config files, encryption key, providers, network reachability, and a live
-headless browser launch test.
+browser launch test with Canvas 2D, WebGL, and WebGL2 pixel checks.
 
 Auto-cleans stale daemon socket/pid/version sidecar files. Destructive
 repairs (reinstalling Chrome, purging old state files, generating a missing
@@ -3501,12 +3501,12 @@ encryption key) are gated behind --fix.
 
 Options:
   --offline            Skip network probes
-  --quick              Skip the live headless launch test
+  --quick              Skip the live browser launch and graphics checks
   --webgpu             Also run a live WebGPU render probe (renders via a real
                        WebGPU pass and pixel-checks both an in-page readback
                        and a decoded screenshot; launches a second Chrome)
-  --headed             Run the WebGPU probe headed to validate the capture
-                       path (auto-Xvfb on displayless Linux)
+  --headed             Run live browser/graphics probes headed
+                       (auto-Xvfb on displayless Linux)
   --debug              Verbose diagnostics from the probes' scratch daemons
   --fix                Also run destructive repairs
   --json               JSON output
@@ -4356,6 +4356,7 @@ Options:
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
   --input-mode <mode>        Session pointer movement: instant (default), smooth, human
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
+                             WebGL/WebGL2 software fallback is enabled in both modes
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
                              (or AGENT_BROWSER_NO_WEBMCP env)

@@ -1,5 +1,6 @@
-//! Live launch test: spawn a scratch daemon session, launch headless
-//! Chrome, navigate to `about:blank`, then close. Skipped under `--quick`.
+//! Live launch test: spawn a scratch daemon session, navigate to
+//! `about:blank`, and validate Canvas 2D, WebGL, and WebGL2 pixel readback.
+//! Uses headless mode unless `--headed` is set. Skipped under `--quick`.
 //!
 //! A `LaunchGuard` Drop impl ensures the scratch session is closed and its
 //! sidecar files cleaned even on panic or early return.
@@ -51,7 +52,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     let mut _guard: Option<LaunchGuard> = None;
 
     let daemon_opts = DaemonOptions {
-        headed: false,
+        headed: opts.headed,
         debug: opts.debug,
         executable_path: None,
         extensions: &[],
@@ -110,7 +111,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     let launch_cmd = json!({
         "id": new_id(),
         "action": "launch",
-        "headless": true,
+        "headless": !opts.headed,
     });
     if let Err(e) = send_json(launch_cmd, &session) {
         checks.push(
@@ -147,14 +148,15 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     // end of scope; no explicit close here.
     let elapsed = started.elapsed();
     let secs = elapsed.as_secs_f64();
+    let mode = if opts.headed { "Headed" } else { "Headless" };
     if elapsed > Duration::from_secs(5) {
         checks.push(Check::new(
             "launch.elapsed",
             category,
             Status::Warn,
             format!(
-                "Headless launch + about:blank in {:.2}s (slow; expected < 5s)",
-                secs
+                "{} launch + about:blank in {:.2}s (slow; expected < 5s)",
+                mode, secs
             ),
         ));
     } else {
@@ -162,9 +164,91 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
             "launch.elapsed",
             category,
             Status::Pass,
-            format!("Headless launch + about:blank in {:.2}s", secs),
+            format!("{} launch + about:blank in {:.2}s", mode, secs),
         ));
     }
+
+    if env::var("AGENT_BROWSER_ENGINE").as_deref() == Ok("lightpanda") {
+        checks.push(Check::new(
+            "graphics.skipped.lightpanda",
+            "Graphics",
+            Status::Info,
+            "Graphics checks skipped: Lightpanda does not render; use Chrome for Canvas 2D, WebGL, and WebGL2",
+        ));
+        return;
+    }
+
+    check_graphics(checks, &session);
+}
+
+/// Check pixel readback in the existing scratch page without network access.
+fn check_graphics(checks: &mut Vec<Check>, session: &str) {
+    let command = json!({
+        "id": new_id(),
+        "action": "evaluate",
+        "script": include_str!("graphics_probe.js"),
+    });
+    let result = match send_command(command, session) {
+        Ok(response) if response.success => response
+            .data
+            .and_then(|data| data.get("result").cloned())
+            .unwrap_or(Value::Null),
+        Ok(response) => {
+            checks.push(graphics_fail(
+                "graphics.eval",
+                format!(
+                    "Graphics probe failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+            return;
+        }
+        Err(error) => {
+            checks.push(graphics_fail(
+                "graphics.eval",
+                format!("Graphics probe failed: {}", error),
+            ));
+            return;
+        }
+    };
+
+    for (key, name) in [
+        ("canvas2d", "Canvas 2D"),
+        ("webgl", "WebGL"),
+        ("webgl2", "WebGL2"),
+    ] {
+        let probe = &result[key];
+        let id = format!("graphics.{}", key);
+        let detail = probe["detail"].as_str().unwrap_or("missing probe result");
+        let renderer = probe["renderer"]
+            .as_str()
+            .map(|value| format!("; renderer: {}", value))
+            .unwrap_or_default();
+        if probe["ok"].as_bool() == Some(true) {
+            checks.push(Check::new(
+                id,
+                "Graphics",
+                Status::Pass,
+                format!(
+                    "{} rendered and read back pixels ({}{})",
+                    name, detail, renderer
+                ),
+            ));
+        } else {
+            checks.push(graphics_fail(
+                &id,
+                format!("{} rendering failed: {}{}", name, detail, renderer),
+            ));
+        }
+    }
+}
+
+fn graphics_fail(id: &str, message: String) -> Check {
+    Check::new(id, "Graphics", Status::Fail, message).with_fix(
+        "check custom browser flags, GPU drivers, and Chrome's bundled SwiftShader files; run agent-browser install to repair Chrome and re-run doctor with --debug",
+    )
 }
 
 fn send_json(cmd: Value, session: &str) -> Result<(), String> {

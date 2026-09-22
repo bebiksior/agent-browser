@@ -586,7 +586,7 @@ agent-browser doctor --offline --quick  # Skip network probes and the live launc
 agent-browser mcp                     # Start an MCP stdio server
 ```
 
-`doctor` checks your environment, Chrome install, daemon state, config files, encryption key, providers, network reachability, and runs a live headless browser launch test. Stale socket/pid sidecar files are auto-cleaned. Output is also available as `--json` for agents.
+`doctor` checks your environment, Chrome install, daemon state, config files, encryption key, providers, network reachability, and runs a live browser launch test with Canvas 2D, WebGL, and WebGL2 pixel checks. Add `--headed` to check headed rendering (including Xvfb on Linux). Stale socket/pid sidecar files are auto-cleaned. Output is also available as `--json` for agents.
 
 ### Skills
 
@@ -1373,6 +1373,12 @@ This opens a visible browser window instead of running headless.
 On Linux hosts with no display (servers, containers), `--headed` still works: when `DISPLAY` is unset and Xvfb is installed, agent-browser starts a private virtual display for the browser and cleans it up on close (opt out with `AGENT_BROWSER_NO_XVFB=1`). Needed for [WebGPU screenshots](#webgpu), and useful for extensions that misbehave headless.
 
 > **Note:** Browser extensions work in both headed and headless mode (Chrome's `--headless=new`).
+
+## WebGL and WebGL2
+
+Locally launched Chrome enables software WebGL fallback in both headed and headless modes. Hardware rendering remains the default when available; GPU-less containers and Xvfb sessions can use Chromium's bundled SwiftShader. A visible window or virtual display alone does not provide a GPU.
+
+Run `agent-browser doctor --offline --headed` to verify real Canvas 2D, WebGL, and WebGL2 pixel output in headed mode. Use `--headed false` for the headless probe. If a context still fails, check custom graphics flags and whether the Chrome installation includes its SwiftShader libraries. Existing browsers attached through CDP keep their original launch flags and must be relaunched to change rendering support. Lightpanda does not provide browser graphics rendering.
 
 ## WebGPU
 

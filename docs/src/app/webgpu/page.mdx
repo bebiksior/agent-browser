@@ -116,3 +116,7 @@ agent-browser eval "document.querySelector('canvas').getContext('webgpu') ? 'web
 **Custom pixel readbacks: avoid canvas snapshots.** `drawImage(webgpuCanvas, ...)` depends on presentation timing and reads transparent black on some platforms even when rendering works. Render to an offscreen texture and read it back with `copyTextureToBuffer` + `mapAsync` — deterministic on every platform (this is how the doctor probe proves rendering).
 
 **SwiftShader is a CPU rasterizer.** Simple scenes render fine; heavy scenes run at single-digit FPS. That rarely matters for screenshots, but for smooth video of complex scenes use hardware (macOS/Windows, or Linux with real Vulkan drivers and `--use-vulkan=native,--use-webgpu-adapter=default`).
+
+## WebGL and WebGL2 fallback
+
+Locally launched Chrome enables its bundled SwiftShader fallback for WebGL and WebGL2 in both headed and headless modes. Hardware rendering remains available; software rendering supports GPU-less containers and Xvfb sessions. This is separate from the WebGPU preset above. Run `agent-browser doctor --offline --headed` to verify Canvas 2D, WebGL, and WebGL2 pixel output; use `--headed false` for headless. CDP connections preserve the existing browser's launch flags.

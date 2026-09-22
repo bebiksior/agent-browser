@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Browser graphics capability probe</title>
+<body>
+<script>
+function probeWebGL(kind) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 4;
+  document.body.append(canvas);
+  const creationErrors = [];
+  canvas.addEventListener('webglcontextcreationerror', event => {
+    creationErrors.push(event.statusMessage);
+  });
+  const gl = canvas.getContext(kind, { antialias: false });
+  if (!gl) return { context: false, creationErrors };
+
+  const shaders = [];
+  let program;
+  let buffer;
+  try {
+    const webgl2 = kind === 'webgl2';
+    const vertexSource = webgl2
+      ? '#version 300 es\nin vec2 position; void main() { gl_Position = vec4(position, 0.0, 1.0); }'
+      : 'attribute vec2 position; void main() { gl_Position = vec4(position, 0.0, 1.0); }';
+    const fragmentSource = webgl2
+      ? '#version 300 es\nprecision highp float; out vec4 color; void main() { color = vec4(0.0, 1.0, 0.0, 1.0); }'
+      : 'precision highp float; void main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }';
+    for (const [type, source] of [
+      [gl.VERTEX_SHADER, vertexSource],
+      [gl.FRAGMENT_SHADER, fragmentSource],
+    ]) {
+      const shader = gl.createShader(type);
+      shaders.push(shader);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error(`Shader compilation failed: ${gl.getShaderInfoLog(shader)}`);
+      }
+    }
+    program = gl.createProgram();
+    for (const shader of shaders) gl.attachShader(program, shader);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(`Program linking failed: ${gl.getProgramInfoLog(program)}`);
+    }
+    gl.useProgram(program);
+    buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, 'position');
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(1, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const pixel = new Uint8Array(4);
+    gl.readPixels(2, 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    const rendererInfo = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      context: true,
+      version: gl.getParameter(gl.VERSION),
+      renderer: rendererInfo ? gl.getParameter(rendererInfo.UNMASKED_RENDERER_WEBGL) : null,
+      shadersCompiled: shaders.every(shader => gl.getShaderParameter(shader, gl.COMPILE_STATUS)),
+      programLinked: gl.getProgramParameter(program, gl.LINK_STATUS),
+      pixel: Array.from(pixel),
+      error: gl.getError(),
+      contextLost: gl.isContextLost(),
+      creationErrors,
+    };
+  } catch (error) {
+    return { context: true, failure: String(error), creationErrors };
+  } finally {
+    if (buffer) gl.deleteBuffer(buffer);
+    if (program) gl.deleteProgram(program);
+    for (const shader of shaders) gl.deleteShader(shader);
+  }
+}
+
+window.runGraphicsProbe = () => {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  let canvasPixel = null;
+  if (context) {
+    context.fillStyle = '#00ff00';
+    context.fillRect(0, 0, 1, 1);
+    canvasPixel = Array.from(context.getImageData(0, 0, 1, 1).data);
+  }
+  return {
+    webgl: probeWebGL('webgl'),
+    webgl2: probeWebGL('webgl2'),
+    canvasPixel,
+  };
+};
+</script>
+</body>
+</html>

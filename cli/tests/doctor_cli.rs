@@ -67,6 +67,14 @@ fn doctor_offline_quick_json_emits_valid_payload() {
         .as_array()
         .expect("checks should be an array");
     assert!(!checks.is_empty(), "checks array should not be empty");
+    assert!(
+        checks.iter().all(|check| {
+            let id = check["id"].as_str().unwrap_or_default();
+            !id.starts_with("launch.") && !id.starts_with("graphics.")
+        }),
+        "--quick must skip live launch and graphics probes: {}",
+        stdout
+    );
 
     // Every check must have a non-empty id / category / status / message.
     for c in checks {

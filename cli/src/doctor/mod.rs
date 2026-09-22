@@ -2,7 +2,8 @@
 //!
 //! Runs a battery of checks across environment, Chrome install, the ffmpeg
 //! install `record` needs, daemon state, config files, encryption,
-//! providers, network reachability, and a live headless browser launch test.
+//! providers, network reachability, and a live browser launch test with
+//! Canvas 2D, WebGL, and WebGL2 pixel readback.
 //!
 //! Auto-cleans stale daemon socket/pid/version sidecar files. Destructive
 //! repairs (reinstalling Chrome, purging old state files, generating a
@@ -36,9 +37,9 @@ pub struct DoctorOptions {
     /// Forward --debug to the scratch daemons the live probes spawn, so the
     /// "re-run with --debug" fix hints actually produce diagnostics.
     pub debug: bool,
-    /// Run the WebGPU probe headed instead of headless, validating the
-    /// capture path the probe's own failure hint recommends (auto-Xvfb on
-    /// displayless Linux, logged-in desktop on Windows).
+    /// Run live browser probes headed instead of headless (auto-Xvfb on
+    /// displayless Linux, logged-in desktop on Windows). This also validates
+    /// the capture path the WebGPU probe's failure hint recommends.
     pub headed: bool,
 }
 

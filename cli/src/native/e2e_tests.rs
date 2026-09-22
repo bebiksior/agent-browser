@@ -12955,3 +12955,108 @@ async fn e2e_fork_navigation_timeout_preserves_partial_state_and_blocks_recordin
     assert_success(&execute_command(&json!({"id": "close", "action": "close"}), &mut state).await);
     server.abort();
 }
+
+async fn assert_browser_graphics(headless: bool, force_swiftshader: bool) {
+    let (guard, _dir) = binding_test_env();
+    guard.set("AGENT_BROWSER_SESSION", "e2e-graphics");
+    if !headless
+        && cfg!(target_os = "linux")
+        && std::env::var("DISPLAY").unwrap_or_default().is_empty()
+    {
+        let no_xvfb = std::env::var("AGENT_BROWSER_NO_XVFB")
+            .map(|value| value == "1" || value == "true")
+            .unwrap_or(false);
+        let xvfb_available = std::process::Command::new("Xvfb")
+            .arg("-help")
+            .output()
+            .is_ok();
+        if no_xvfb || !xvfb_available {
+            eprintln!(
+                "Skipping headed graphics test: DISPLAY is unset and automatic Xvfb is disabled or unavailable"
+            );
+            return;
+        }
+    }
+
+    let mut state = DaemonState::new();
+    let mut command = json!({"id": "launch", "action": "launch", "headless": headless});
+    if force_swiftshader {
+        command["args"] = json!(["--use-gl=angle", "--use-angle=swiftshader-webgl"]);
+    }
+    let launch = execute_command(&command, &mut state).await;
+    let mut navigation = Value::Null;
+    let mut probe = Value::Null;
+    if launch["success"] == true {
+        let url = format!(
+            "data:text/html;base64,{}",
+            STANDARD.encode(include_str!("test_fixtures/graphics_probe.html"))
+        );
+        navigation = execute_command(
+            &json!({"id": "open", "action": "navigate", "url": url}),
+            &mut state,
+        )
+        .await;
+        if navigation["success"] == true {
+            probe = execute_command(
+                &json!({"id": "probe", "action": "evaluate", "script": "runGraphicsProbe()"}),
+                &mut state,
+            )
+            .await;
+        }
+    }
+    // Close before assertions so a graphics failure does not leave Chrome running.
+    let close = execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    assert_success(&launch);
+    assert_success(&navigation);
+    assert_success(&probe);
+    assert_success(&close);
+    let result = &get_data(&probe)["result"];
+    assert_eq!(result["canvasPixel"], json!([0, 255, 0, 255]), "{result}");
+    for (kind, version) in [("webgl", "WebGL 1.0"), ("webgl2", "WebGL 2.0")] {
+        let graphics = &result[kind];
+        assert_eq!(graphics["context"], true, "{kind}: {graphics}");
+        assert!(graphics.get("failure").is_none(), "{kind}: {graphics}");
+        assert!(
+            graphics["version"].as_str().unwrap().starts_with(version),
+            "{kind}: {graphics}"
+        );
+        assert_eq!(graphics["shadersCompiled"], true, "{kind}: {graphics}");
+        assert_eq!(graphics["programLinked"], true, "{kind}: {graphics}");
+        assert_eq!(
+            graphics["pixel"],
+            json!([0, 255, 0, 255]),
+            "{kind}: {graphics}"
+        );
+        assert_eq!(graphics["error"], 0, "{kind}: {graphics}");
+        assert_eq!(graphics["contextLost"], false, "{kind}: {graphics}");
+        assert_eq!(graphics["creationErrors"], json!([]), "{kind}: {graphics}");
+        if force_swiftshader {
+            assert!(
+                graphics["renderer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains("swiftshader"),
+                "expected the requested software renderer, got {kind}: {graphics}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_graphics_headless_webgl_and_webgl2_render() {
+    assert_browser_graphics(true, false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_graphics_headed_webgl_and_webgl2_render() {
+    assert_browser_graphics(false, false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_graphics_headed_swiftshader_webgl_and_webgl2_render() {
+    assert_browser_graphics(false, true).await;
+}

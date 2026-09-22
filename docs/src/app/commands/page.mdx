@@ -516,6 +516,7 @@ Diagnose your install, auto-clean stale daemon files, and optionally repair comm
 agent-browser doctor                     # Full diagnosis (env, Chrome, daemons, config, providers, network, launch test)
 agent-browser doctor --offline --quick   # Local-only, fastest
 agent-browser doctor --fix               # Also run destructive repairs (reinstall Chrome, purge old state, ...)
+agent-browser doctor --headed            # Verify headed Canvas 2D, WebGL, and WebGL2 rendering
 agent-browser doctor --webgpu            # Also run a live WebGPU render probe (see the WebGPU page)
 agent-browser doctor --json              # Structured JSON output for agents
 ```

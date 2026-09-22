@@ -1966,8 +1966,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_DOCTOR,
             "Doctor",
-            "Diagnose the installation.",
-            json!({ "offline": { "type": "boolean" }, "quick": { "type": "boolean" }, "fix": { "type": "boolean" }, "webgpu": { "type": "boolean", "description": "Also run a live WebGPU render probe (launches a second Chrome)." }, "headed": { "type": "boolean", "description": "Run the WebGPU probe headed to validate the capture path (auto-Xvfb on displayless Linux). Explicit true/false overrides AGENT_BROWSER_HEADED/config." }, "debug": { "type": "boolean", "description": "Verbose diagnostics from the probes' scratch daemons." } }),
+            "Diagnose the installation, including live Canvas 2D, WebGL, and WebGL2 rendering unless quick is true.",
+            json!({ "offline": { "type": "boolean" }, "quick": { "type": "boolean" }, "fix": { "type": "boolean" }, "webgpu": { "type": "boolean", "description": "Also run a live WebGPU render probe (launches a second Chrome)." }, "headed": { "type": "boolean", "description": "Run live browser and graphics probes headed (auto-Xvfb on displayless Linux). Explicit true/false overrides AGENT_BROWSER_HEADED/config." }, "debug": { "type": "boolean", "description": "Verbose diagnostics from the probes' scratch daemons." } }),
             &[],
         ),
         tool(
@@ -4839,7 +4839,11 @@ mod tests {
             vec!["doctor", "--offline"]
         );
         // Value-taking booleans forwarded both ways so env/config can be
-        // overridden.
+        // overridden. Headed graphics checks do not require the WebGPU probe.
+        assert_eq!(
+            doctor_args(&json!({ "headed": true })).unwrap(),
+            vec!["doctor", "--headed", "true"]
+        );
         assert_eq!(
             doctor_args(&json!({ "webgpu": true, "headed": false })).unwrap(),
             vec!["doctor", "--webgpu", "true", "--headed", "false"]

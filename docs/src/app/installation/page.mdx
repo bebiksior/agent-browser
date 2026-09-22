@@ -91,6 +91,7 @@ Detects your installation method (npm, Homebrew, or Cargo) and runs the appropri
 agent-browser doctor                     # Full diagnosis
 agent-browser doctor --offline --quick   # Local-only, fastest (~<1s)
 agent-browser doctor --fix               # Also run destructive repairs
+agent-browser doctor --headed            # Check headed Canvas 2D, WebGL, and WebGL2 rendering
 agent-browser doctor --webgpu            # Also run a live WebGPU render probe
 agent-browser doctor --json              # Structured output
 ```
@@ -109,7 +110,7 @@ It checks:
 <tr><td>Security</td><td>Encryption key env var or <code>~/.agent-browser/.encryption-key</code> (with 0600 permissions on unix), state file count and age vs <code>AGENT_BROWSER_STATE_EXPIRE_DAYS</code>, action policy file</td></tr>
 <tr><td>Providers</td><td>Env vars for Browserless, Browserbase, Browser Use, Kernel, AgentCore (AWS creds), Appium (for <code>--provider ios</code>), and <code>AI_GATEWAY_API_KEY</code> for chat</td></tr>
 <tr><td>Network</td><td>Reachability of the Chrome for Testing CDN, AI Gateway (if configured), and any currently selected provider endpoint (skipped under <code>--offline</code>)</td></tr>
-<tr><td>Launch test</td><td>Spawns a scratch session, launches headless Chrome, navigates to <code>about:blank</code>, then closes. Measures wall time (skipped under <code>--quick</code>)</td></tr>
+<tr><td>Launch test</td><td>Spawns a scratch session, launches Chrome, and verifies Canvas 2D, WebGL, and WebGL2 pixel output on <code>about:blank</code> before closing. Add <code>--headed</code> to check headed/Xvfb rendering. Skipped under <code>--quick</code>; Lightpanda skips graphics checks.</td></tr>
 <tr><td>WebGPU probe</td><td>Opt-in via <code>--webgpu</code>: launches a scratch session with the <a href="/webgpu">WebGPU preset</a>, renders through a real WebGPU pass, and pixel-checks both an offscreen readback and a decoded screenshot. Add <code>--headed</code> to validate the headed/Xvfb capture path</td></tr>
 </tbody>
 </table>
