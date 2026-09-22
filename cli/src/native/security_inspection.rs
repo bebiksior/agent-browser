@@ -418,7 +418,9 @@ fn ordered_reachable_frame_ids(
 
 fn parse_attributes(attributes: &[Value]) -> BTreeMap<String, String> {
     attributes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter_map(|pair| {
             Some((
                 pair.first()?.as_str()?.to_ascii_lowercase(),

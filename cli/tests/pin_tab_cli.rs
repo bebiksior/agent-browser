@@ -151,7 +151,10 @@ impl Sessions {
 impl Drop for Sessions {
     fn drop(&mut self) {
         for session in &self.names {
-            let _ = self.command(session).arg("close").output();
+            let _ = self
+                .command(session)
+                .args(["close", "--force-ownership"])
+                .output();
         }
     }
 }
@@ -181,7 +184,7 @@ fn cdp_pin_tab_precedes_attach_in_existing_daemon() {
     sessions.run_json(victim, &["--cdp", ws_url, "--pin-tab", "open", &mine_url]);
 
     assert_eq!(sessions.pid(victim), pid_before);
-    let tabs = sessions.run_json(host, &["tab", "list"]);
+    let tabs = sessions.run_json(victim, &["tab", "list"]);
     let tabs = tabs["data"]["tabs"].as_array().unwrap();
     let shared = tabs
         .iter()
@@ -239,7 +242,9 @@ fn tab_gone_exposes_safe_recovery_data_in_cli_and_batch() {
     let target_id = binding["targetId"].as_str().unwrap();
     assert_eq!(binding["url"], safe_url);
 
-    sessions.run_json(host, &["tab", "close", target_id]);
+    let denied = sessions.run_json_failure(host, &["tab", "close", target_id]);
+    assert_eq!(denied["code"], "ownership_conflict");
+    sessions.run_json(host, &["--force-ownership", "tab", "close", target_id]);
 
     let single = sessions.run_json_failure(victim, &["get", "url"]);
     assert_eq!(single["code"], "tab_gone");

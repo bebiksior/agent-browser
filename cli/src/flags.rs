@@ -79,6 +79,7 @@ pub struct Config {
     pub device: Option<String>,
     pub hide_scrollbars: Option<bool>,
     pub webgpu: Option<bool>,
+    pub no_webmcp: Option<bool>,
     pub ignore_https_errors: Option<bool>,
     pub ca_cert: Option<String>,
     pub clear_ca_cert: Option<bool>,
@@ -161,6 +162,7 @@ impl Config {
             device: other.device.or(self.device),
             hide_scrollbars: other.hide_scrollbars.or(self.hide_scrollbars),
             webgpu: other.webgpu.or(self.webgpu),
+            no_webmcp: other.no_webmcp.or(self.no_webmcp),
             ignore_https_errors: other.ignore_https_errors.or(self.ignore_https_errors),
             ca_cert,
             clear_ca_cert,
@@ -306,6 +308,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--action-policy",
         "--confirm-actions",
         "--engine",
+        "--input-mode",
         "--screenshot-dir",
         "--screenshot-quality",
         "--screenshot-format",
@@ -389,6 +392,7 @@ pub struct Flags {
     pub allow_file_access: bool,
     pub hide_scrollbars: bool,
     pub webgpu: bool,
+    pub no_webmcp: bool,
     /// Env-only (AGENT_BROWSER_NO_XVFB): disable automatic Xvfb for headed
     /// launches on displayless Linux hosts.
     pub no_xvfb: bool,
@@ -420,6 +424,8 @@ pub struct Flags {
     pub plugins: Vec<PluginConfig>,
     pub verbose: bool,
     pub quiet: bool,
+    /// Session input behavior selected with `--input-mode`.
+    pub input_mode: String,
 
     // Track which launch-time options were explicitly passed via CLI
     // (as opposed to being set only via environment variables)
@@ -440,11 +446,14 @@ pub struct Flags {
     pub cli_download_path: bool,
     pub cli_headed: bool,
     pub cli_webgpu: bool,
+    pub cli_no_webmcp: bool,
     pub cli_restore: bool,
     /// True when --pin-tab / --no-pin-tab was passed on the command line, so
     /// an explicit disable can be sent to the daemon (a bare `pin_tab: false`
     /// just means "absent" and must not override a sticky pin).
     pub cli_pin_tab: bool,
+    /// True when `--input-mode` was explicitly passed, including `instant`.
+    pub cli_input_mode: bool,
 }
 
 pub fn parse_flags(args: &[String]) -> Flags {
@@ -589,6 +598,8 @@ pub fn parse_flags(args: &[String]) -> Flags {
             .or(config.hide_scrollbars)
             .unwrap_or(true),
         webgpu: env_var_is_truthy("AGENT_BROWSER_WEBGPU") || config.webgpu.unwrap_or(false),
+        no_webmcp: env_var_is_truthy("AGENT_BROWSER_NO_WEBMCP")
+            || config.no_webmcp.unwrap_or(false),
         no_xvfb: env_var_is_truthy("AGENT_BROWSER_NO_XVFB"),
         device: env::var("AGENT_BROWSER_IOS_DEVICE").ok().or(config.device),
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
@@ -657,6 +668,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         plugins,
         verbose: false,
         quiet: false,
+        input_mode: "instant".to_string(),
         cli_executable_path: false,
         cli_extensions: false,
         cli_init_scripts: false,
@@ -674,8 +686,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_download_path: false,
         cli_headed: false,
         cli_webgpu: false,
+        cli_no_webmcp: false,
         cli_restore: false,
         cli_pin_tab: false,
+        cli_input_mode: false,
     };
 
     let mut i = 0;
@@ -715,6 +729,14 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.webgpu = val;
                 flags.cli_webgpu = true;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--no-webmcp" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.no_webmcp = val;
+                flags.cli_no_webmcp = true;
                 if consumed {
                     i += 1;
                 }
@@ -1043,6 +1065,21 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--input-mode" => {
+                if let Some(s) = args.get(i + 1) {
+                    if matches!(s.as_str(), "instant" | "smooth" | "human") {
+                        flags.input_mode = s.clone();
+                        flags.cli_input_mode = true;
+                    } else {
+                        eprintln!(
+                            "{} --input-mode must be instant, smooth, or human, got '{}'",
+                            color::warning_indicator(),
+                            s
+                        );
+                    }
+                    i += 1;
+                }
+            }
             "--screenshot-dir" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.screenshot_dir = Some(s.clone());
@@ -1159,6 +1196,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--json",
         "--headed",
         "--webgpu",
+        "--no-webmcp",
         "--debug",
         "--ignore-https-errors",
         "--allow-file-access",
@@ -1213,6 +1251,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--confirm-actions",
         "--config",
         "--engine",
+        "--input-mode",
         "--screenshot-dir",
         "--screenshot-quality",
         "--screenshot-format",
@@ -1492,6 +1531,14 @@ mod tests {
     fn test_clean_args_removes_idle_timeout_before_command() {
         let cleaned = clean_args(&args("--idle-timeout 10s open example.com"));
         assert_eq!(cleaned, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_clean_args_keeps_record_fps() {
+        // --fps belongs to `record`, so it must reach the command parser even
+        // when global flags are mixed in.
+        let cleaned = clean_args(&args("--json record start demo.webm --fps 60"));
+        assert_eq!(cleaned, vec!["record", "start", "demo.webm", "--fps", "60"]);
     }
 
     #[test]
@@ -2213,5 +2260,32 @@ mod tests {
         let flags = parse_flags(&args("--timeout 60s open example.com"));
         assert_eq!(flags.command_timeout, Some(60_000));
         assert_eq!(flags.default_timeout, None);
+    }
+
+    #[test]
+    fn test_no_webmcp_flag() {
+        let flags = parse_flags(&args("--no-webmcp open example.com"));
+        assert!(flags.no_webmcp);
+        assert!(flags.cli_no_webmcp);
+        assert_eq!(
+            clean_args(&args("--no-webmcp open example.com")),
+            args("open example.com")
+        );
+    }
+
+    #[test]
+    fn test_input_mode_is_explicit_and_removed_from_command_args() {
+        let input = args("--input-mode human open example.com");
+        let flags = parse_flags(&input);
+        assert_eq!(flags.input_mode, "human");
+        assert!(flags.cli_input_mode);
+        assert_eq!(clean_args(&input), args("open example.com"));
+    }
+
+    #[test]
+    fn test_input_mode_defaults_without_overwriting_session() {
+        let flags = parse_flags(&args("click @e1"));
+        assert_eq!(flags.input_mode, "instant");
+        assert!(!flags.cli_input_mode);
     }
 }
