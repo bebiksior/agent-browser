@@ -2031,6 +2031,20 @@ fn main() {
             cmd_obj.insert("profile".to_string(), json!(profile_path));
         }
 
+        let env_defaults: Vec<&str> = [
+            (
+                "executablePath",
+                flags.executable_path.is_some() && !flags.cli_executable_path,
+            ),
+            ("profile", flags.profile.is_some() && !flags.cli_profile),
+        ]
+        .into_iter()
+        .filter_map(|(field, from_env)| from_env.then_some(field))
+        .collect();
+        if !env_defaults.is_empty() {
+            cmd_obj.insert("envDefaults".to_string(), json!(env_defaults));
+        }
+
         // Add state path if specified
         if let Some(ref state_path) = flags.state {
             cmd_obj.insert("storageState".to_string(), json!(state_path));

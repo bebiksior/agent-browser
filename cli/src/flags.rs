@@ -702,10 +702,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
 
     let mut i = 0;
     let mut seen_command = false;
+    let mut command = None;
     while i < args.len() {
         let arg = args[i].as_str();
         if !arg.starts_with('-') && looks_like_command(arg) {
             seen_command = true;
+            command.get_or_insert(arg);
         }
         match arg {
             s if s.starts_with("--restore=") => {
@@ -876,6 +878,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            // `context new --state` seeds the new context; as a launch option it
+            // would also clash with any configured profile.
+            "--state" if command == Some("context") => i += 1,
             "--state" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.state = Some(s.clone());
@@ -1181,8 +1186,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
     .find_map(|key| env::var(key).ok().filter(|value| !value.trim().is_empty()));
     if flags.session == "default" {
         if let Some(task_id) = task_id.as_deref() {
-            let safe = crate::validation::sanitize_session_component(task_id);
-            flags.session = format!("worker-{}", safe.chars().take(48).collect::<String>());
+            flags.session = worker_session(task_id);
             if flags.namespace.is_none() {
                 flags.namespace = Some(flags.session.clone());
             }
@@ -1197,6 +1201,15 @@ pub fn parse_flags(args: &[String]) -> Flags {
     }
 
     flags
+}
+
+/// The session also names its namespace directory, so a full task id would push the
+/// socket path past the 103-byte Unix limit.
+fn worker_session(task_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(task_id.as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("worker-{hex}")
 }
 
 fn looks_like_command(value: &str) -> bool {
@@ -1280,6 +1293,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
 
     let mut i = 0;
     let mut seen_command = false;
+    let mut command = None;
     while i < args.len() {
         let arg = &args[i];
         if skip_next {
@@ -1287,8 +1301,19 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             i += 1;
             continue;
         }
+        if !arg.starts_with('-') && looks_like_command(arg) {
+            command.get_or_insert(arg.as_str());
+        }
         if arg.starts_with("--restore=") {
             i += 1;
+            continue;
+        }
+        if arg == "--state" && command == Some("context") {
+            result.push(arg.clone());
+            if let Some(path) = args.get(i + 1) {
+                result.push(path.clone());
+            }
+            i += 2;
             continue;
         }
         if GLOBAL_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
@@ -1332,6 +1357,35 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn test_worker_session_is_short_and_stable() {
+        let id = "00000000-0000-7000-8000-000000000001";
+        assert_eq!(worker_session(id), worker_session(id));
+        assert_ne!(
+            worker_session(id),
+            worker_session("00000000-0000-7000-8000-000000000002")
+        );
+        assert_eq!(worker_session(id).len(), "worker-".len() + 12);
+    }
+
+    #[test]
+    fn test_context_new_state_is_not_launch_state() {
+        let flags = parse_flags(&args("context new --state auth.json --cookies-only"));
+        assert_eq!(flags.state, None);
+        let flags = parse_flags(&args("--state auth.json open example.com"));
+        assert_eq!(flags.state, Some("auth.json".to_string()));
+        assert_eq!(
+            clean_args(&args(
+                "--session a context new --state auth.json --cookies-only x.com"
+            )),
+            args("context new --state auth.json --cookies-only x.com")
+        );
+        assert_eq!(
+            clean_args(&args("--state auth.json open x.com")),
+            args("open x.com")
+        );
     }
 
     #[test]

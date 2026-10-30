@@ -489,25 +489,28 @@ impl PostMessageMonitor {
         self.drain_new();
         let mut first_error = None;
         for installation in &self.installations {
-            if let Err(error) = client
-                .send_command(
+            for (method, params) in [
+                (
                     "Page.removeScriptToEvaluateOnNewDocument",
-                    Some(json!({ "identifier": installation.script_identifier })),
-                    Some(&installation.session_id),
-                )
-                .await
-            {
-                first_error.get_or_insert(error);
-            }
-            if let Err(error) = client
-                .send_command(
+                    json!({ "identifier": installation.script_identifier }),
+                ),
+                (
                     "Runtime.removeBinding",
-                    Some(json!({ "name": self.options.binding_name })),
-                    Some(&installation.session_id),
-                )
-                .await
-            {
-                first_error.get_or_insert(error);
+                    json!({ "name": self.options.binding_name }),
+                ),
+            ] {
+                match client
+                    .send_command(method, Some(params), Some(&installation.session_id))
+                    .await
+                {
+                    // A target that navigated cross-process or closed took its script and
+                    // binding with it.
+                    Err(error) if is_detached_session_error(&error) => break,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Ok(_) => {}
+                }
             }
         }
         if let Some(error) = first_error {
@@ -515,6 +518,10 @@ impl PostMessageMonitor {
         }
         Ok(self.history)
     }
+}
+
+fn is_detached_session_error(error: &str) -> bool {
+    error.contains("Session with given id not found")
 }
 
 fn monitor_script(options: &PostMessageMonitorOptions) -> String {

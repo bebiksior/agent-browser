@@ -736,6 +736,8 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Executable and profile the current browser was launched with by `launch`.
+    launched_paths: Option<(Option<String>, Option<String>)>,
     effective_ca_cert: Option<EffectiveCaCert>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
@@ -877,6 +879,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            launched_paths: None,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
@@ -2812,6 +2815,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     }
     let browser = state.browser.take();
     state.launch_hash = None;
+    state.launched_paths = None;
     state.webmcp_enabled = false;
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
@@ -5658,6 +5662,23 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         }
     }
     apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
+    // Follow-up commands re-send env defaults for launch options they did not set, which
+    // would otherwise relaunch a browser started with explicit ones onto about:blank.
+    if state.browser.is_some() {
+        if let Some((executable_path, profile)) = state.launched_paths.clone() {
+            let env_defaults = string_array_from_command(cmd, "envDefaults").unwrap_or_default();
+            if env_defaults.iter().any(|field| field == "executablePath") {
+                launch_options.executable_path = executable_path;
+            }
+            if env_defaults.iter().any(|field| field == "profile") {
+                launch_options.profile = profile;
+            }
+        }
+    }
+    let requested_paths = (
+        launch_options.executable_path.clone(),
+        launch_options.profile.clone(),
+    );
 
     let external_launch =
         cdp_url.is_some() || cdp_port.is_some() || auto_connect || provider_name.is_some();
@@ -5921,6 +5942,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
+    state.launched_paths = Some(requested_paths);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();
