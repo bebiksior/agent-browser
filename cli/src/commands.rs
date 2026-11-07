@@ -1598,19 +1598,30 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                         }));
                     }
 
-                    let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                    const USAGE: &str = "cookies set <name> <value> [--url <url>] [--domain <domain>] [--path <path>] [--httpOnly] [--secure] [--sameSite <Strict|Lax|None>] [--expires <timestamp>]\n  or:  cookies set <name>=<value> [options]\n  or:  cookies set --curl <file> [--domain <domain>] [--url <url>]";
+                    let missing = || ParseError::MissingArguments {
                         context: "cookies set".to_string(),
-                        usage: "cookies set <name> <value> [--url <url>] [--domain <domain>] [--path <path>] [--httpOnly] [--secure] [--sameSite <Strict|Lax|None>] [--expires <timestamp>]\n  or:  cookies set --curl <file> [--domain <domain>] [--url <url>]",
-                    })?;
-                    let value = rest.get(2).ok_or_else(|| ParseError::MissingArguments {
-                        context: "cookies set".to_string(),
-                        usage: "cookies set <name> <value> [--url <url>] [--domain <domain>] [--path <path>] [--httpOnly] [--secure] [--sameSite <Strict|Lax|None>] [--expires <timestamp>]\n  or:  cookies set --curl <file> [--domain <domain>] [--url <url>]",
-                    })?;
+                        usage: USAGE,
+                    };
+                    let first = *rest.get(1).ok_or_else(missing)?;
+                    // `name=value` is a single argument; the next one is then
+                    // already an option, never the value.
+                    let (name, value, mut i) = match first.split_once('=') {
+                        Some((name, value))
+                            if !name.is_empty()
+                                && rest.get(2).is_none_or(|next| next.starts_with("--")) =>
+                        {
+                            (name, value, 2)
+                        }
+                        _ => (first, *rest.get(2).ok_or_else(missing)?, 3),
+                    };
+                    if value.starts_with("--") && i == 3 {
+                        return Err(missing());
+                    }
 
                     let mut cookie = json!({ "name": name, "value": value });
 
                     // Parse optional flags
-                    let mut i = 3;
                     while i < rest.len() {
                         match rest[i] {
                             "--url" => {
@@ -4211,6 +4222,7 @@ mod tests {
             cli_restore: false,
             cli_pin_tab: false,
             cli_input_mode: false,
+            cli_launch: false,
             annotate: false,
             color_scheme: None,
             download_path: None,
@@ -4265,6 +4277,32 @@ mod tests {
     #[test]
     fn test_cookies_set_missing_value() {
         let result = parse_command(&args("cookies set mycookie"), &default_flags());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cookies_set_name_equals_value() {
+        let cmd = parse_command(
+            &args("cookies set TESTPROBE=abc=123 --domain .example.com --path /"),
+            &default_flags(),
+        )
+        .unwrap();
+        let cookie = &cmd["cookies"][0];
+        assert_eq!(cookie["name"], "TESTPROBE");
+        assert_eq!(cookie["value"], "abc=123");
+        assert_eq!(cookie["domain"], ".example.com");
+        assert_eq!(cookie["path"], "/");
+
+        let cmd = parse_command(&args("cookies set TESTPROBE=abc"), &default_flags()).unwrap();
+        assert_eq!(cmd["cookies"][0]["value"], "abc");
+    }
+
+    #[test]
+    fn test_cookies_set_does_not_take_an_option_as_the_value() {
+        let result = parse_command(
+            &args("cookies set TESTPROBE --domain .example.com"),
+            &default_flags(),
+        );
         assert!(result.is_err());
     }
 

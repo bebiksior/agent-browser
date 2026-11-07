@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -143,24 +144,36 @@ pub async fn run_daemon(session: &str) {
     )
     .await;
 
-    #[cfg(unix)]
-    {
-        let _ = fs::remove_file(&socket_path);
-    }
-    #[cfg(windows)]
-    {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
-    }
-    let _ = fs::remove_file(&pid_path);
-    let _ = fs::remove_file(&version_path);
-    let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
+    release_session_files(session);
 
     if let Err(e) = result {
         let _ = writeln!(std::io::stderr(), "Daemon error: {}", e);
         process::exit(1);
+    }
+}
+
+static SESSION_FILES_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Removes the socket and session metadata once. After a close they may
+/// already belong to a successor daemon, so later calls do nothing.
+fn release_session_files(session: &str) {
+    if SESSION_FILES_RELEASED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let socket_dir = get_daemon_socket_dir();
+    #[cfg(unix)]
+    let _ = fs::remove_file(socket_dir.join(format!("{}.sock", session)));
+    #[cfg(windows)]
+    let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+    for suffix in [
+        "pid",
+        "version",
+        "stream",
+        "engine",
+        "provider",
+        "extensions",
+    ] {
+        let _ = fs::remove_file(socket_dir.join(format!("{}.{}", session, suffix)));
     }
 }
 
@@ -581,23 +594,28 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
-                let response = {
+                let (response, session) = {
                     let mut s = state.lock().await;
                     let response = execute_command(&cmd, &mut s).await;
                     // Refresh while the state lock is still held. An idle
                     // timer waiting on this command will observe the updated
                     // clock as soon as it acquires the lock.
                     idle_activity.mark();
-                    response
+                    (response, s.session_id.clone())
                 };
+
+                let closing = close_completed_response(&action, &response);
+                // Unlink before replying: a client that connects to a daemon
+                // on its way out reads EOF instead of starting a fresh one.
+                if closing {
+                    release_session_files(&session);
+                }
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
                 resp.push('\n');
-                if writer.write_all(resp.as_bytes()).await.is_err() {
-                    break;
-                }
+                let written = writer.write_all(resp.as_bytes()).await.is_ok();
 
-                if close_completed_response(&action, &response) {
+                if closing {
                     if let Some(ref path) = stream_file_cleanup {
                         let _ = fs::remove_file(path);
                     }
@@ -607,6 +625,9 @@ async fn handle_connection<S>(
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     close_notify.notify_one();
                     return;
+                }
+                if !written {
+                    break;
                 }
             }
             Err(_) => break,

@@ -320,6 +320,14 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         && flags.provider.is_none()
         && !flags.auto_connect
         && !command_is_external_launch(command)
+        && !command_is_daemon_only(command)
+}
+
+/// Commands the daemon answers without a browser. A launch envelope ahead of
+/// them would start one just to list owners, read state, or close it again.
+fn command_is_daemon_only(cmd: &serde_json::Value) -> bool {
+    let action = cmd.get("action").and_then(|value| value.as_str());
+    action.is_some_and(|action| action != "launch" && native::actions::skip_launch_action(action))
 }
 
 /// Sends this invocation's resolved Obscura bypass setting, including an explicit clear.
@@ -2016,6 +2024,11 @@ fn main() {
         }
         launch_cmd["plugins"] = json!(flags.plugins.clone());
         attach_restore_config_to_command(&mut launch_cmd, &flags);
+        // Env and config defaults ride along on every command; only options
+        // given on this command line may relaunch a running browser.
+        if !flags.cli_launch && cmd.get("action").and_then(|v| v.as_str()) != Some("launch") {
+            launch_cmd["implicit"] = json!(true);
+        }
 
         let cmd_obj = launch_cmd
             .as_object_mut()
@@ -2788,6 +2801,37 @@ mod tests {
 
         flags.cdp = Some("9222".to_string());
         assert!(!should_send_local_launch_config(&flags, &command));
+    }
+
+    #[test]
+    fn test_daemon_only_commands_skip_local_launch_configuration() {
+        let mut flags = neutral_launch_config_flags();
+        flags.headed = true;
+        flags.profile = Some("/tmp/profile".to_string());
+        for argv in [
+            "browser owners",
+            "browser lease acquire",
+            "close",
+            "session",
+            "state list",
+        ] {
+            let argv: Vec<String> = argv.split(' ').map(String::from).collect();
+            let Ok(command) = parse_command(&argv, &flags) else {
+                continue;
+            };
+            assert!(
+                !should_send_local_launch_config(&flags, &command),
+                "{:?} must not launch a browser",
+                command["action"]
+            );
+        }
+        let open = parse_command(&["open".to_string()], &flags).unwrap();
+        assert_eq!(open["action"], "launch");
+        assert!(should_send_local_launch_config(&flags, &open));
+        assert!(should_send_local_launch_config(
+            &flags,
+            &json!({ "action": "snapshot" })
+        ));
     }
 
     #[test]

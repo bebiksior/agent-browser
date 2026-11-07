@@ -294,7 +294,7 @@ agent-browser target eval <target-id> "self.location.href"
 echo "self.registration.scope" | agent-browser target eval <target-id> --stdin
 ```
 
-Target evaluation requires Chromium CDP. It awaits promises, returns the same by-value result or evaluation error as `eval`, and releases its temporary CDP session after the command. Only service workers, shared workers, dedicated workers, and extension background pages in the active browser context are eligible. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused. The command also accepts `-b`/`--base64` for scripts that are difficult to quote.
+Target evaluation requires Chromium CDP. It awaits promises, returns the same by-value result or evaluation error as `eval`, and releases its temporary CDP session after the command. Only service workers, shared workers, dedicated workers, extension background pages, and `chrome-extension://` pages such as side panels and popups in the active browser context are eligible. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused. The command also accepts `-b`/`--base64` for scripts that are difficult to quote.
 
 ### Snapshot deltas
 

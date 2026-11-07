@@ -187,9 +187,12 @@ pub fn select_target_for_evaluation(
     let target = graph
         .get(target_id)
         .ok_or_else(|| format!("Unknown target ID: {target_id}"))?;
-    if !TARGET_EVAL_TYPES.contains(&target.target_type.as_str()) {
+    // Extension side panels and popups are pages that never become tabs.
+    let extension_page =
+        target.target_type == "page" && target.url.starts_with("chrome-extension://");
+    if !TARGET_EVAL_TYPES.contains(&target.target_type.as_str()) && !extension_page {
         return Err(format!(
-            "Target {} has unsupported type '{}'; target eval accepts only service_worker, shared_worker, worker, and background_page targets",
+            "Target {} has unsupported type '{}'; target eval accepts only service_worker, shared_worker, worker, background_page, and chrome-extension:// page targets",
             target.target_id, target.target_type
         ));
     }
@@ -1060,6 +1063,40 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("unsupported type 'page'"));
+    }
+
+    #[test]
+    fn target_eval_accepts_extension_pages() {
+        let graph = parse_target_graph(&json!({
+            "targetInfos": [
+                {
+                    "targetId": "PAGE",
+                    "type": "page",
+                    "title": "Page",
+                    "url": "https://example.test/"
+                },
+                {
+                    "targetId": "SIDE_PANEL",
+                    "type": "page",
+                    "title": "Panel",
+                    "url": "chrome-extension://abcdefghijklmnopabcdefghijklmnop/panel.html"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let target = select_target_for_evaluation(
+            &graph,
+            "SIDE_PANEL",
+            "PAGE",
+            true,
+            "session-a",
+            &WorkerIdentity::new("worker-a"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(target.target_id, "SIDE_PANEL");
     }
 
     #[test]

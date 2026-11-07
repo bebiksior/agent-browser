@@ -458,6 +458,8 @@ pub struct Flags {
     pub cli_pin_tab: bool,
     /// True when `--input-mode` was explicitly passed, including `instant`.
     pub cli_input_mode: bool,
+    /// True when any browser launch option was passed on this command line.
+    pub cli_launch: bool,
 }
 
 pub fn parse_flags(args: &[String]) -> Flags {
@@ -698,6 +700,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_restore: false,
         cli_pin_tab: false,
         cli_input_mode: false,
+        cli_launch: false,
     };
 
     let mut i = 0;
@@ -1176,6 +1179,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
+    flags.cli_launch = args.iter().any(|arg| {
+        LAUNCH_FLAGS.contains(&arg.split_once('=').map_or(arg.as_str(), |(name, _)| name))
+    });
+
     let task_id = [
         "CODEX_THREAD_ID",
         "CLAUDE_SESSION_ID",
@@ -1202,6 +1209,33 @@ pub fn parse_flags(args: &[String]) -> Flags {
 
     flags
 }
+
+/// Flags that configure the browser launch rather than one command.
+const LAUNCH_FLAGS: &[&str] = &[
+    "--headed",
+    "--executable-path",
+    "--extension",
+    "--init-script",
+    "--enable",
+    "--profile",
+    "--state",
+    "--proxy",
+    "--proxy-bypass",
+    "--args",
+    "--user-agent",
+    "--ignore-https-errors",
+    "--ca-cert",
+    "--no-ca-cert",
+    "--use-system-ca",
+    "--allow-file-access",
+    "--hide-scrollbars",
+    "--webgpu",
+    "--no-webmcp",
+    "--color-scheme",
+    "--download-path",
+    "--allowed-domains",
+    "--engine",
+];
 
 /// The session also names its namespace directory, so a full task id would push the
 /// socket path past the 103-byte Unix limit.
@@ -1647,6 +1681,21 @@ mod tests {
     fn test_cli_extension_tracking() {
         let flags = parse_flags(&args("--extension /path/to/ext snapshot"));
         assert!(flags.cli_extensions);
+    }
+
+    #[test]
+    fn test_cli_launch_tracks_only_launch_options() {
+        assert!(!parse_flags(&args("snapshot -i")).cli_launch);
+        assert!(!parse_flags(&args("--session a get url")).cli_launch);
+        assert!(parse_flags(&args("--extension /path/to/ext snapshot")).cli_launch);
+        assert!(parse_flags(&args("open x.com --headed")).cli_launch);
+        assert!(parse_flags(&args("--proxy=http://127.0.0.1:1 open x.com")).cli_launch);
+    }
+
+    #[test]
+    fn test_worker_session_matches_box_wrapper_hash() {
+        // tooling/hackbot/deploy/hackbot-agent-browser: printf %s ID | sha256sum | cut -c1-12
+        assert_eq!(worker_session("thread-1"), "worker-4b0a5fefc328");
     }
 
     #[test]

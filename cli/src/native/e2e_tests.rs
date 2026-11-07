@@ -7913,6 +7913,60 @@ async fn e2e_relaunch_on_options_change() {
     assert_success(&resp);
 }
 
+/// Follow-up commands send an implicit launch envelope built from env
+/// defaults. It must not drop options an earlier command set explicitly,
+/// but a changed proxy still relaunches so traffic never takes the old route.
+#[tokio::test]
+#[ignore]
+async fn e2e_implicit_launch_keeps_explicit_options_unless_proxy_changes() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "userAgent": "agent-browser-test/1.0"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "launch", "headless": true, "implicit": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["reused"], true);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "evaluate", "script": "navigator.userAgent" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "agent-browser-test/1.0");
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "launch",
+            "headless": true,
+            "implicit": true,
+            "proxy": { "server": "http://127.0.0.1:9" }
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("reused").is_none());
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // ---------------------------------------------------------------------------
 // Stream: URL events follow active main-frame navigation
 // ---------------------------------------------------------------------------

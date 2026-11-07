@@ -330,7 +330,7 @@ Array.from(links).map(a => a.href);
 EOF
 ```
 
-`target eval` is the non-page CDP-target equivalent of `eval`. It accepts service workers, shared workers, dedicated workers, and extension background pages only when they share the active browser context. It rejects shared CDP default contexts and any context containing a target owned by another session or worker; use a dedicated locally launched browser when the target has no browser context ID. The command awaits promises and returns the same by-value result or evaluation error without changing the active tab. It accepts `-b`/`--base64` and `--stdin` for scripts that are difficult to quote.
+`target eval` is the non-page CDP-target equivalent of `eval`. It accepts service workers, shared workers, dedicated workers, extension background pages, and `chrome-extension://` pages such as side panels and popups that are not tabs, only when they share the active browser context. It rejects shared CDP default contexts and any context containing a target owned by another session or worker; use a dedicated locally launched browser when the target has no browser context ID. The command awaits promises and returns the same by-value result or evaluation error without changing the active tab. It accepts `-b`/`--base64` and `--stdin` for scripts that are difficult to quote.
 
 ## Authentication and Plugins
 

@@ -176,6 +176,7 @@ pub fn claim(request: OwnershipRequest) -> Result<ClaimOutcome, String> {
         let path = registry_path();
         let mut registry: OwnershipRegistry = read_secure_json(&path)?.unwrap_or_default();
         validate_registry(&registry)?;
+        prune_dead_owners(&mut registry);
 
         if let Some(existing) = registry
             .owners
@@ -260,6 +261,7 @@ pub fn force_claim(request: OwnershipRequest) -> Result<ClaimOutcome, String> {
         let path = registry_path();
         let mut registry: OwnershipRegistry = read_secure_json(&path)?.unwrap_or_default();
         validate_registry(&registry)?;
+        prune_dead_owners(&mut registry);
 
         registry.owners.retain(|owner| {
             owner.target_id != request.target_id
@@ -294,6 +296,7 @@ pub fn force_claim_target(
 pub fn list() -> Result<Vec<BrowserOwner>, String> {
     let mut registry: OwnershipRegistry = read_secure_json(&registry_path())?.unwrap_or_default();
     validate_registry(&registry)?;
+    prune_dead_owners(&mut registry);
     sort_owners(&mut registry.owners);
     Ok(registry.owners)
 }
@@ -311,8 +314,9 @@ pub fn list_by_target(target_id: &str) -> Result<Vec<BrowserOwner>, String> {
 /// Report a conflict for a proposed claim without modifying the registry.
 pub fn detect_conflict(request: &OwnershipRequest) -> Result<Option<OwnershipConflict>, String> {
     validate_request(request)?;
-    let registry: OwnershipRegistry = read_secure_json(&registry_path())?.unwrap_or_default();
+    let mut registry: OwnershipRegistry = read_secure_json(&registry_path())?.unwrap_or_default();
     validate_registry(&registry)?;
+    prune_dead_owners(&mut registry);
 
     if let Some(existing) = registry
         .owners
@@ -404,6 +408,14 @@ pub fn release_session(
         atomic_write_json(&path, &registry)?;
         Ok(OwnershipReleaseOutcome::Released { owner: first })
     })
+}
+
+/// The recorded pid is the daemon that made the claim. Once it is gone, so is
+/// the browser it controlled, and a successor daemon has a new identity.
+fn prune_dead_owners(registry: &mut OwnershipRegistry) {
+    registry
+        .owners
+        .retain(|owner| is_worker_process_alive(&owner.worker) != Some(false));
 }
 
 fn conflict(
@@ -865,6 +877,31 @@ mod tests {
             };
             assert_eq!(conflict.kind, OwnershipConflictKind::SessionOwned);
             assert_eq!(conflict.existing.target_id, "target-a");
+        });
+    }
+
+    #[test]
+    fn claims_of_a_dead_daemon_do_not_block_its_successor() {
+        with_socket_dir(|_| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            let dead = WorkerIdentity {
+                id: format!("pid-{dead_pid}"),
+                pid: Some(dead_pid),
+                host: local_hostname(),
+            };
+            claim_target("agent-a", "target-a", "", dead).unwrap();
+            assert!(list().unwrap().is_empty());
+
+            let successor = WorkerIdentity::for_current_process("pid-successor");
+            let request = OwnershipRequest::new("agent-a", "target-b", "", successor.clone());
+            assert_eq!(detect_conflict(&request).unwrap(), None);
+            let result = claim_target("agent-a", "target-b", "", successor).unwrap();
+            assert!(matches!(result, ClaimOutcome::Claimed { .. }));
+            let owners = list().unwrap();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].target_id, "target-b");
         });
     }
 

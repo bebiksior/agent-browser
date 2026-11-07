@@ -738,6 +738,8 @@ pub struct DaemonState {
     launch_hash: Option<u64>,
     /// Executable and profile the current browser was launched with by `launch`.
     launched_paths: Option<(Option<String>, Option<String>)>,
+    /// Proxy server and bypass list the current browser was launched with.
+    launched_proxy: Option<(Option<String>, Option<String>)>,
     effective_ca_cert: Option<EffectiveCaCert>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
@@ -880,6 +882,7 @@ impl DaemonState {
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
             launched_paths: None,
+            launched_proxy: None,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
@@ -2816,6 +2819,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     let browser = state.browser.take();
     state.launch_hash = None;
     state.launched_paths = None;
+    state.launched_proxy = None;
     state.webmcp_enabled = false;
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
@@ -2909,7 +2913,7 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
     Value::Object(options)
 }
 
-fn skip_launch_action(action: &str) -> bool {
+pub(crate) fn skip_launch_action(action: &str) -> bool {
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         return true;
     }
@@ -5550,6 +5554,12 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     let requested_allowed_domains = allowed_domains_from_launch_command(cmd);
     let previous_domain_filter = state.domain_filter.read().await.clone();
     let existing_allowed_domains = current_allowed_domains(state).await;
+    // A relaunch is how a new allowlist reaches WebRTC, so it is never implicit.
+    // A changed proxy (such as a new egress) is checked once options are resolved.
+    let implicit = cmd.get("implicit").and_then(Value::as_bool) == Some(true)
+        && requested_allowed_domains
+            .as_ref()
+            .is_none_or(|domains| *domains == existing_allowed_domains);
     let allowed_domains = requested_allowed_domains
         .clone()
         .unwrap_or(existing_allowed_domains);
@@ -5733,7 +5743,14 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         let is_external =
             launch_connection_is_external(cdp_url, cdp_port, auto_connect, provider_name);
         let was_external = mgr.is_cdp_connection();
-        let hash_changed = state.launch_hash != Some(new_hash);
+        let proxy_changed = state.launched_proxy.as_ref().is_some_and(|launched| {
+            *launched
+                != (
+                    launch_options.proxy.clone(),
+                    launch_options.proxy_bypass.clone(),
+                )
+        });
+        let hash_changed = state.launch_hash != Some(new_hash) && (!implicit || proxy_changed);
         let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
         is_external != was_external
             || hash_changed
@@ -5940,9 +5957,14 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
     state.reset_input_state();
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
+    let launched_proxy = (
+        launch_options.proxy.clone(),
+        launch_options.proxy_bypass.clone(),
+    );
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
     state.launched_paths = Some(requested_paths);
+    state.launched_proxy = Some(launched_proxy);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();

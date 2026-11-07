@@ -424,7 +424,7 @@ agent-browser target eval <target-id> "self.location.href"
 echo "self.registration.scope" | agent-browser target eval <target-id> --stdin
 ```
 
-Target evaluation uses the same by-value result and exception behavior as `eval`, awaits promises, and releases its temporary CDP session after the command. It accepts only service workers, shared workers, dedicated workers, and extension background pages in the active browser context. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused.
+Target evaluation uses the same by-value result and exception behavior as `eval`, awaits promises, and releases its temporary CDP session after the command. It accepts only service workers, shared workers, dedicated workers, extension background pages, and `chrome-extension://` pages such as side panels and popups in the active browser context. The default context is eligible only in a dedicated locally launched browser; shared CDP default contexts and contexts with targets owned by another session or worker are refused.
 
 ### Isolated contexts
 
