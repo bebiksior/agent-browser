@@ -281,7 +281,7 @@ When several sessions share one Chrome over `--cdp <port>`, add `--pin-tab` so e
 
 Iframes are inlined in the snapshot, so their refs work directly. To scope a snapshot to one frame, run `agent-browser frame @e3`, then `agent-browser frame main` to return.
 
-Alerts and `beforeunload` dialogs are retained instead of auto-accepted, and navigation returns on a dialog by default. Handle them with `agent-browser dialog status`, `dialog accept [text]`, `dialog dismiss`, `dialog wait --timeout 5000`, or read `dialog history` after they close. `click` already returns when it opens a dialog; do not add a blind sleep.
+Alerts and `beforeunload` dialogs are retained instead of auto-accepted, and navigation returns on a dialog by default. Handle them with `agent-browser dialog status`, `dialog accept [text]`, `dialog dismiss`, `agent-browser dialog wait --timeout 5000`, or read `dialog history` after they close. `click` already returns when it opens a dialog; do not add a blind sleep.
 
 ## Troubleshooting
 
