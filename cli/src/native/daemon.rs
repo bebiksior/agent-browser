@@ -16,6 +16,7 @@ use super::actions::{
     maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
+use super::idle_park;
 use super::state;
 use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
@@ -242,6 +243,7 @@ async fn run_socket_server(
             stream_server,
             idle_activity.clone(),
         )));
+    idle_park::spawn(state.clone(), idle_activity.clone());
 
     // Lets handle_connection end the daemon loop after a "close" command,
     // instead of calling process::exit() which skips destructors and can
@@ -322,6 +324,7 @@ async fn run_socket_server(
                         DEFAULT_IDLE_TIMEOUT_MS / 60_000
                     );
                 }
+                idle_park::resume(&mut s).await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
                 break;
@@ -344,6 +347,7 @@ async fn run_socket_server(
                     Some(idle_lock) => idle_lock.await,
                     None => state.clone().lock_owned().await,
                 };
+                idle_park::resume(&mut s).await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
                 break;
@@ -407,6 +411,7 @@ async fn run_socket_server(
             stream_server,
             idle_activity.clone(),
         )));
+    idle_park::spawn(state.clone(), idle_activity.clone());
 
     let close = Arc::new(CloseHandshake::default());
     let mut closed_by_command = false;
@@ -484,6 +489,7 @@ async fn run_socket_server(
                         DEFAULT_IDLE_TIMEOUT_MS / 60_000
                     );
                 }
+                idle_park::resume(&mut s).await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
                 break;
@@ -503,6 +509,7 @@ async fn run_socket_server(
                     Some(idle_lock) => idle_lock.await,
                     None => state.clone().lock_owned().await,
                 };
+                idle_park::resume(&mut s).await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
                 break;
@@ -546,7 +553,7 @@ fn spawn_background_tick_if_idle(
                     "Failed to apply browser network controls: {}",
                     error
                 );
-            } else {
+            } else if !state.idle_park.has_frozen() {
                 maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
         }
@@ -623,6 +630,7 @@ async fn handle_connection<S>(
 
                 let response = {
                     let mut s = state.lock().await;
+                    idle_park::resume(&mut s).await;
                     let response = execute_command(&cmd, &mut s).await;
                     // Refresh while the state lock is still held. An idle
                     // timer waiting on this command will observe the updated

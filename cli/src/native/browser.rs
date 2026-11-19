@@ -1904,6 +1904,15 @@ impl BrowserManager {
         }
     }
 
+    /// The process id of a Chrome this daemon launched; `None` for another
+    /// engine or a browser it only attached to.
+    pub(crate) fn chrome_pid(&self) -> Option<u32> {
+        match self.browser_process.as_ref()? {
+            BrowserProcess::Chrome(process) => Some(process.id()),
+            _ => None,
+        }
+    }
+
     pub fn get_cdp_url(&self) -> &str {
         &self.ws_url
     }

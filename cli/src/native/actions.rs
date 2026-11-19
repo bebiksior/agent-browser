@@ -759,6 +759,7 @@ pub struct DaemonState {
     evidence_initial_frames: Vec<Value>,
     evidence_last_dialog_id: Option<u64>,
     postmessage_monitor: Option<super::postmessage::PostMessageMonitor>,
+    pub(crate) idle_park: super::idle_park::Parked,
     /// A `page_wedged` report whose response may not have reached the client,
     /// keyed by the request id. The client's read timeout can expire before
     /// the daemon finishes replacing the tab, so a retry of the same request
@@ -959,6 +960,7 @@ impl DaemonState {
             evidence_initial_frames: Vec::new(),
             evidence_last_dialog_id: None,
             postmessage_monitor: None,
+            idle_park: Default::default(),
             undelivered_wedge: None,
             pending_pointer_release: None,
             stream_client: None,
@@ -987,6 +989,10 @@ impl DaemonState {
     /// WebDriver-backed Safari and iOS sessions are always headed, while CDP
     /// sessions delegate the decision to BrowserManager. Provider-owned CDP
     /// connections remain eligible because the daemon owns their lifecycle.
+    pub(crate) fn has_postmessage_monitor(&self) -> bool {
+        self.postmessage_monitor.is_some()
+    }
+
     pub(crate) fn blocks_default_idle_shutdown(&self) -> bool {
         default_idle_shutdown_is_blocked(
             matches!(self.backend_type, BackendType::WebDriver),

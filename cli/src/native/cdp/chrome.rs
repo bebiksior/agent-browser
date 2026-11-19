@@ -424,6 +424,16 @@ impl Default for LaunchOptions {
     }
 }
 
+/// Software WebGL can keep several cores busy on one page, so hosts without a
+/// GPU can turn it off with `AGENT_BROWSER_WEBGL=false`.
+fn webgl_enabled() -> bool {
+    webgl_setting_enables(std::env::var("AGENT_BROWSER_WEBGL").ok().as_deref())
+}
+
+fn webgl_setting_enables(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+}
+
 struct ChromeArgs {
     args: Vec<String>,
     user_data_dir: PathBuf,
@@ -502,10 +512,14 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--use-mock-keychain".to_string());
     }
 
-    // Allow software WebGL fallback in both modes. Headed Chrome under Xvfb
-    // can lack a GPU too; this opt-in keeps WebGL available without forcing
-    // software rendering on machines with a supported hardware backend.
-    args.push("--enable-unsafe-swiftshader".to_string());
+    if options.webgpu || webgl_enabled() {
+        // Allow software WebGL fallback in both modes. Headed Chrome under Xvfb
+        // can lack a GPU too; this opt-in keeps WebGL available without forcing
+        // software rendering on machines with a supported hardware backend.
+        args.push("--enable-unsafe-swiftshader".to_string());
+    } else {
+        args.push("--disable-3d-apis".to_string());
+    }
 
     let effectively_headless = options.effectively_headless();
 
@@ -2158,6 +2172,16 @@ exec sleep 60
                 .any(|arg| arg == "--proxy-bypass-list=localhost,*.example.com"));
             std::fs::remove_dir_all(result.temp_user_data_dir.unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn test_webgl_stays_on_unless_explicitly_disabled() {
+        assert!(webgl_setting_enables(None));
+        assert!(webgl_setting_enables(Some("true")));
+        assert!(webgl_setting_enables(Some("")));
+        assert!(!webgl_setting_enables(Some("false")));
+        assert!(!webgl_setting_enables(Some(" 0 ")));
+        assert!(!webgl_setting_enables(Some("No")));
     }
 
     #[test]

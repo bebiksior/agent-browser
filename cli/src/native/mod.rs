@@ -26,6 +26,7 @@ pub mod element;
 pub mod evidence;
 #[allow(dead_code)]
 pub mod flow;
+pub mod idle_park;
 #[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]

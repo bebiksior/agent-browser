@@ -5056,6 +5056,7 @@ Environment:
   AGENT_BROWSER_NO_XVFB          Disable automatic Xvfb for headed mode on displayless Linux hosts
   AGENT_BROWSER_NO_VERSION_CHECK Skip the outdated-Chrome CVE check (it fetches chromereleases.googleblog.com)
   AGENT_BROWSER_WEBGPU           Enable WebGPU (SwiftShader software Vulkan on Linux)
+  AGENT_BROWSER_WEBGL            Set to false to launch Chrome without WebGL (software WebGL is costly on hosts without a GPU)
   AGENT_BROWSER_JSON             JSON output
   AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend
   AGENT_BROWSER_DEBUG            Debug output
@@ -5090,6 +5091,10 @@ Environment:
   AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (default: 3600000 = 1h; 0 disables)
                                  Dashboard input resets the timer; headed, Safari/iOS WebDriver, and user-attached browsers are exempt from the default
                                  Provider-owned cloud browsers remain eligible for default cleanup
+  AGENT_BROWSER_IDLE_BACKGROUND_MS
+                                 Put a launched Chrome's tabs in the background after N ms without a command, behind a blank tab,
+                                 so idle pages stop animating; the next command brings them back first (default: off)
+  AGENT_BROWSER_IDLE_FREEZE_CPU  Freeze backgrounded tabs while Chrome still uses this percent of a core (default: 20; 0 never freezes)
   AGENT_BROWSER_IOS_DEVICE       Default iOS device name
   AGENT_BROWSER_IOS_UDID         Default iOS device UDID
   AGENT_BROWSER_CONTENT_BOUNDARIES Wrap page output in boundary markers
